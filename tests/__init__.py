@@ -1,0 +1,1 @@
+"""Polars Avro tests."""

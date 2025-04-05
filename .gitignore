@@ -1,0 +1,12 @@
+__pycache__/
+.coverage
+.venv
+*.egg-info
+*.pyo
+*.pyc
+*.so
+build/
+dist/
+out/
+target/
+wheels/
