@@ -1,0 +1,46 @@
+[project]
+name = "polars-avro"
+version = "0.1.0"
+description = "Polars io-plugin for reading and writing avro files"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "maturin>=1.8.2",
+    "polars>=1.24.0",
+    "pyarrow>=19.0.1",
+    "ruff>=0.11.4",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "myst-parser>=4.0.1",
+    "nbformat>=5.10.4",
+    "pyright>=1.1.398",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+    "sphinx>=8.2.3",
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "polars_avro._avro_rs"
+features = ["pyo3/extension-module", "pyo3"]
+
+[tool.ruff.lint]
+extend-select = ["I", "D", "A", "B", "W", "PL", "UP", "FIX"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.pytest.ini_options]
+addopts = "--cov --cov-report term-missing"
+
+[tool.pyright]
+strict = ["polars_avro", "tests"]
+
+[tool.uv]
+keyring-provider = "subprocess"
