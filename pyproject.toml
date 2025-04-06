@@ -3,7 +3,7 @@ name = "polars-avro"
 version = "0.1.0"
 description = "Polars io-plugin for reading and writing avro files"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "maturin>=1.8.2",
     "polars>=1.24.0",
@@ -18,8 +18,9 @@ dev = [
     "nbformat>=5.10.4",
     "pyright>=1.1.398",
     "pytest>=8.3.5",
+    "pytest-benchmark>=5.1.0",
     "pytest-cov>=6.0.0",
-    "sphinx>=8.2.3",
+    "sphinx>=8.1.3",
 ]
 
 [build-system]

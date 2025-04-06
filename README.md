@@ -2,6 +2,16 @@
 
 A polars io plugin for reading and writing avro files.
 
+Polars is likely deprecating support for reading and writing avro files, and
+this plugin fills in support. Currently it's about 7x slower at reading avro
+files and up to 20x slower at writing files.
+
+However, in exchange for speed you get:
+
+1. future proof - this won't get deprecated
+2. robust support - the current polars avro implementation has bugs with non-contiguous data frames
+3. scan support - this can scan and push down predicates by chunk
+
 ## Python Usage
 
 ```py
@@ -19,7 +29,6 @@ iterator of `DataFrames` from polars `ScanSources`, and `sink_avro` for writing
 an iterator of `DataFrame`s to a `Write`able.
 
 ```rs
-
 use polars_avro::{AvroScanner, sink_avro, WriteOptions};
 
 let scanner = AvroScanner::new_from_sources(
