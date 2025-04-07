@@ -70,7 +70,8 @@ For local rust development, run
 uv run maturin develop -m Cargo.toml
 ```
 
-to build a local copy of the rust interface.
+to build a local copy of the rust interface. Add `-r` if you want to trust the
+benchmark results.
 
 ### Testing
 

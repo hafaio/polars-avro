@@ -49,7 +49,7 @@ class AvroSource:
     ) -> AvroIter: ...
 
 def write_avro(
-    frame: DataFrame,
+    frames: list[DataFrame],
     dest: str | BinaryIO,
     codec: Codec,
     promote_ints: bool,

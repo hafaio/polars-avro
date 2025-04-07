@@ -61,7 +61,7 @@ def write_avro(  # noqa: PLR0913
     )
 
     write_avro_rs(
-        frame,
+        [frame],
         normed,
         codec,
         promote_ints,

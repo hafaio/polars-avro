@@ -245,11 +245,11 @@ impl From<Codec> for AvroCodec {
 }
 
 #[pyfunction]
-#[pyo3(signature = (frame, dest, codec, promote_ints, promote_array, truncate_time, cloud_options, credential_provider, retries))]
+#[pyo3(signature = (frames, dest, codec, promote_ints, promote_array, truncate_time, cloud_options, credential_provider, retries))]
 #[allow(clippy::too_many_arguments)]
 fn write_avro(
     py: Python,
-    frame: PyDataFrame,
+    frames: Vec<PyDataFrame>,
     dest: PyObject,
     codec: Codec,
     promote_ints: bool,
@@ -259,8 +259,6 @@ fn write_avro(
     credential_provider: Option<PyObject>,
     retries: usize,
 ) -> PyResult<()> {
-    let PyDataFrame(frame) = frame;
-
     let cloud_options = if let Ok(path) = dest.extract::<Cow<str>>(py) {
         let base_options =
             CloudOptions::from_untyped_config(&path, cloud_options.unwrap_or_default())
@@ -278,7 +276,7 @@ fn write_avro(
 
     let dest = polars_python::file::try_get_writeable(dest, cloud_options.as_ref())?;
     sink_avro(
-        [frame],
+        frames.into_iter().map(|PyDataFrame(frame)| frame),
         dest,
         WriteOptions {
             codec: codec.into(),
