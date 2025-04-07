@@ -1,9 +1,10 @@
 """Sphinx build."""
 
 import sys
-import tomllib
 from datetime import date
 from os import path
+
+import tomllib
 
 # make sure one level up is on python path
 sys.path.append(path.abspath(".."))
