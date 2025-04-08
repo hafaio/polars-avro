@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [features]
 pyo3 = [
@@ -48,3 +48,4 @@ pyo3-polars = { version = "0.20.0", features = [
 
 [dev-dependencies]
 chrono = "0.4.40"
+polars-io = { version = "0.46.0", features = ["file_cache", "avro"] }
