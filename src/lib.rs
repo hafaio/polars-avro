@@ -3,6 +3,8 @@
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
 
+// FIXME add rust tests to ci
+
 mod des;
 mod error;
 mod io;

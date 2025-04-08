@@ -77,7 +77,7 @@ impl CloudParams {
                 *file_cache_ttl,
             )?;
             *self = CloudParams::Parsed(options);
-        };
+        }
         match self {
             CloudParams::Init { .. } => unreachable!(),
             CloudParams::Parsed(options) => Ok(options.as_ref()),

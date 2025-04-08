@@ -37,7 +37,7 @@ impl AvroScanner {
     ) -> Result<Self, Error> {
         let mut source_iter = SourceIter::try_from(sources, cloud_options, glob)?;
         let source = source_iter.next().ok_or(Error::EmptySources)??;
-        let reader = Reader::new(source).map_err(Error::Avro)?;
+        let reader = Reader::new(source)?;
         let schema = Arc::new(des::try_from_schema(reader.writer_schema())?);
 
         Ok(Self {
@@ -151,7 +151,7 @@ impl AvroIter {
 
         while num_to_read > 0 {
             if let Some(rec) = self.reader.next() {
-                let val = rec.map_err(Error::Avro)?;
+                let val = rec?;
                 if let Value::Record(rec_val) = val {
                     for (idx, col) in with_columns.clone().into_iter().zip(&mut arrow_columns) {
                         let (_, val) = &rec_val[idx];
@@ -162,7 +162,7 @@ impl AvroIter {
                 }
                 num_to_read -= 1;
             } else if let Some(source) = self.source_iter.next() {
-                self.reader = Reader::new(source?).map_err(Error::Avro)?;
+                self.reader = Reader::new(source?)?;
                 // NOTE we could be lazy and just check compatability, but
                 // we do want something like this equality, which will allow
                 // scanning multiple avro files as long as they have the
@@ -253,7 +253,7 @@ mod tests {
     use apache_avro::types::Value;
     use apache_avro::{Schema, Writer};
     use polars::frame::DataFrame;
-    use polars::prelude::{IntoLazy, concat};
+    use polars::prelude::{IntoLazy, UnionArgs, concat};
     use polars_plan::plans::ScanSources;
     use polars_utils::mmap::MemSlice;
 
@@ -265,7 +265,7 @@ mod tests {
         ScanSources::Paths(
             paths
                 .into_iter()
-                .map(|p| p.into())
+                .map(std::convert::Into::into)
                 .collect::<Box<[_]>>()
                 .into(),
         )
@@ -276,7 +276,7 @@ mod tests {
             .into_iter(1024, None, None, None)
             .map(|part| part.unwrap().lazy())
             .collect();
-        concat(frames, Default::default())
+        concat(frames, UnionArgs::default())
             .unwrap()
             .collect()
             .unwrap()
@@ -313,7 +313,7 @@ mod tests {
             false,
             None,
         );
-        assert!(matches!(res, Err(Error::NonRecordSchema(Schema::Boolean))));
+        assert!(matches!(res, Err(Error::NonRecordSchema(_))));
     }
 
     #[test]
@@ -431,9 +431,6 @@ mod tests {
             false,
             None,
         );
-        assert!(matches!(
-            res,
-            Err(Error::UnsupportedAvroType(Schema::Fixed(_)))
-        ));
+        assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
     }
 }

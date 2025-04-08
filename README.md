@@ -76,10 +76,20 @@ benchmark results.
 ### Testing
 
 ```sh
-cargo clippy --all-features
+cargo fmt --check
+cargo +nightly clippy --all-features
 cargo test
 uv run ruff format --check
 uv run ruff check
 uv run pyright
 uv run pytest
 ```
+
+### Benchmarks
+
+```sh
+cargo +nightly bench
+uv run pytest
+```
+
+> ℹ️ For python benchmarks, make sure you've compiled in release mode: `uv run maturin develop -m Cargo.toml -r`

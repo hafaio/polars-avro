@@ -65,16 +65,14 @@ pub fn sink_avro(
                     part.get_row_amortized(idx, &mut row)
                         .map_err(Error::Polars)?;
                     let Row(record) = &row;
-                    writer
-                        .append(ser::try_as_value(&schema, record)?)
-                        .map_err(Error::Avro)?;
+                    writer.append(ser::try_as_value(&schema, record)?)?;
                 }
             } else {
                 return Err(Error::NonMatchingSchemas);
             }
         }
         // flush does not write header, but into_inner does
-        writer.into_inner().map_err(Error::Avro)?;
+        writer.into_inner()?;
     }
     Ok(())
 }
