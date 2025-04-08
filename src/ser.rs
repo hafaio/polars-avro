@@ -140,9 +140,10 @@ impl Serializer {
             }
             _ => return Err(Error::UnsupportedPolarsType(dtype.clone())),
         };
-        Ok(AvroSchema::Union(
-            UnionSchema::new(vec![AvroSchema::Null, base]).map_err(Error::Avro)?,
-        ))
+        Ok(AvroSchema::Union(UnionSchema::new(vec![
+            AvroSchema::Null,
+            base,
+        ])?))
     }
 }
 

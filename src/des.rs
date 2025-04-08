@@ -28,7 +28,7 @@ pub fn try_from_schema(schema: &AvroSchema) -> Result<PlSchema, Error> {
             })
             .collect::<Result<_, Error>>()?)
     } else {
-        Err(Error::NonRecordSchema(schema.clone()))
+        Err(Error::NonRecordSchema(Box::new(schema.clone())))
     }
 }
 
@@ -71,11 +71,11 @@ fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
                 .iter()
                 .filter(|var| !matches!(var, AvroSchema::Null));
             if union.variants().is_empty() {
-                Err(Error::UnsupportedAvroType(schema.clone()))
+                Err(Error::UnsupportedAvroType(Box::new(schema.clone())))
             } else if let Some(rem) = variants.next() {
                 if variants.next().is_some() {
                     // union with more than 1 non-null element
-                    Err(Error::UnsupportedAvroType(schema.clone()))
+                    Err(Error::UnsupportedAvroType(Box::new(schema.clone())))
                 } else {
                     // else try again on non-union
                     try_from_dtype(rem)
@@ -94,7 +94,7 @@ fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
         | AvroSchema::LocalTimestampMicros
         | AvroSchema::LocalTimestampNanos
         | AvroSchema::Duration
-        | AvroSchema::Ref { .. } => Err(Error::UnsupportedAvroType(schema.clone())),
+        | AvroSchema::Ref { .. } => Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
     }
 }
 
@@ -163,7 +163,7 @@ impl ValueBuilder for MutableNullArray {
                     format!("expected null but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -178,7 +178,7 @@ impl ValueBuilder for MutableBooleanArray {
                     format!("expected bool but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -193,7 +193,7 @@ impl ValueBuilder for MutableBinaryViewArray<str> {
                     format!("expected string but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -208,7 +208,7 @@ impl ValueBuilder for MutableBinaryViewArray<[u8]> {
                     format!("expected bytes but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -223,7 +223,7 @@ impl ValueBuilder for MutablePrimitiveArray<i32> {
                     format!("expected int but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -241,7 +241,7 @@ impl ValueBuilder for MutablePrimitiveArray<i64> {
             &Value::TimeMicros(val) => self.push_value(val * 1_000),
             &Value::TimeMillis(val) => self.push_value(i64::from(val) * 1_000_000),
             _ => return Err(PolarsError::SchemaMismatch(format!("expected long, timestamp, or time but got {value:?}").into())),
-        };
+        }
         Ok(())
     }
 }
@@ -256,7 +256,7 @@ impl ValueBuilder for MutablePrimitiveArray<u32> {
                     format!("expected enum but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -271,7 +271,7 @@ impl ValueBuilder for MutablePrimitiveArray<f32> {
                     format!("expected float but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -286,7 +286,7 @@ impl ValueBuilder for MutablePrimitiveArray<f64> {
                     format!("expected double but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -480,7 +480,7 @@ impl ValueBuilder for StructBuilder {
                     format!("expected record but got {value:?}").into(),
                 ));
             }
-        };
+        }
         Ok(())
     }
 }

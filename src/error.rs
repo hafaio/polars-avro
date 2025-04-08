@@ -14,13 +14,13 @@ pub enum Error {
     /// An error from polars
     Polars(PolarsError),
     /// An error propogated from the underlying avro library
-    Avro(AvroError),
+    Avro(Box<AvroError>),
     /// Cannot scan empty sources
     EmptySources,
     /// Top level avro schema must be a record
-    NonRecordSchema(Schema),
+    NonRecordSchema(Box<Schema>),
     /// Avro and arrow don't share the same types
-    UnsupportedAvroType(Schema),
+    UnsupportedAvroType(Box<Schema>),
     /// Avro and arrow don't share the same types and this type can't be cnverted
     ///
     /// There are options for sink that allow promotion or truncation that alter
@@ -82,6 +82,12 @@ impl Display for Error {
 
 impl StdError for Error {}
 
+impl From<AvroError> for Error {
+    fn from(value: AvroError) -> Self {
+        Self::Avro(Box::new(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use apache_avro::{Error as AvroError, Schema, types::Value};
@@ -96,19 +102,17 @@ mod tests {
     fn test_display() {
         for err in [
             Error::Polars(PolarsError::NoData("test".into())),
-            Error::Avro(AvroError::EmptyUnion),
+            Error::Avro(Box::new(AvroError::EmptyUnion)),
             Error::EmptySources,
-            Error::NonRecordSchema(Schema::Null),
-            Error::UnsupportedAvroType(Schema::Null),
+            Error::NonRecordSchema(Box::new(Schema::Null)),
+            Error::UnsupportedAvroType(Box::new(Schema::Null)),
             Error::UnsupportedPolarsType(DataType::Null),
             Error::NullEnum,
             Error::NonMatchingSchemas,
             Error::InvalidArrowType(DataType::Null, ArrowDataType::Null),
             Error::InvalidAvroValue(Value::Null),
-        ]
-        .into_iter()
-        {
-            assert!(!format!("{err}").is_empty())
+        ] {
+            assert!(!format!("{err}").is_empty());
         }
     }
 }
