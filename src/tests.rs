@@ -20,12 +20,17 @@ fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
 fn deserialize(buff: Vec<u8>) -> DataFrame {
     let sources = ScanSources::Buffers(vec![MemSlice::from_vec(buff)].into_boxed_slice().into());
     let scanner = AvroScanner::new_from_sources(&sources, false, None).unwrap();
-    let iter = scanner.into_iter(2, None, None, None);
+    let schema = scanner.schema();
+    let iter = scanner.into_iter(2, None);
     let parts: Vec<_> = iter.map(|part| part.unwrap().lazy()).collect();
-    concat(parts, UnionArgs::default())
-        .unwrap()
-        .collect()
-        .unwrap()
+    if parts.is_empty() {
+        DataFrame::empty_with_schema(&schema)
+    } else {
+        concat(parts, UnionArgs::default())
+            .unwrap()
+            .collect()
+            .unwrap()
+    }
 }
 
 #[test]

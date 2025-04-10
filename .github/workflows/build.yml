@@ -34,7 +34,7 @@ jobs:
       - name: Check rust format
         run: cargo fmt --check
       - name: Check rust style
-        run: cargo +nightly clippy --all-features
+        run: cargo clippy --all-features
       - name: Run rust tests
         run: cargo test
       - name: Check ruff format

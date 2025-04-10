@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import BinaryIO
 
-from polars import DataFrame, Expr
+from polars import DataFrame
 from polars._typing import SchemaDict  # type: ignore[reportPrivateImportUsage]
 from polars.io.cloud.credential_provider._builder import (
     CredentialProviderBuilder,  # type: ignore[reportPrivateImportUsage]
@@ -34,18 +34,8 @@ class AvroSource:
         file_cache_ttl: int | None,
     ) -> None: ...
     def schema(self) -> SchemaDict: ...
-    def iter_with_predicate(
-        self,
-        n_rows: int | None,
-        batch_size: int,
-        with_columns: list[str] | None,
-        predicate: Expr,
-    ) -> AvroIter: ...
-    def iter_without_predicate(
-        self,
-        n_rows: int | None,
-        batch_size: int,
-        with_columns: list[str] | None,
+    def batch_iter(
+        self, batch_size: int, with_columns: list[str] | None
     ) -> AvroIter: ...
 
 def write_avro(

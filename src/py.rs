@@ -1,6 +1,7 @@
 //! pyo3 bindings
 
 use std::borrow::Cow;
+use std::iter::Fuse;
 use std::sync::Arc;
 
 use apache_avro::Codec as AvroCodec;
@@ -16,7 +17,7 @@ use pyo3::{
     pymodule, wrap_pyfunction,
 };
 use pyo3_polars::error::PyPolarsErr;
-use pyo3_polars::{PyDataFrame, PyExpr, PySchema};
+use pyo3_polars::{PyDataFrame, PySchema};
 
 use crate::{AvroIter, AvroScanner, Error, WriteOptions, sink_avro};
 
@@ -30,8 +31,7 @@ fn parse_cloud_options(
     match (sources.first_path(), cloud_options) {
         (Some(first_path), Some(cloud_options)) => {
             let mut cloud_options =
-                CloudOptions::from_untyped_config(&first_path.to_string_lossy(), cloud_options)
-                    .map_err(Error::Polars)?;
+                CloudOptions::from_untyped_config(&first_path.to_string_lossy(), cloud_options)?;
             cloud_options = cloud_options
                 .with_max_retries(retries)
                 .with_credential_provider(
@@ -86,7 +86,7 @@ impl CloudParams {
 }
 
 #[pyclass]
-pub struct PyAvroIter(AvroIter);
+pub struct PyAvroIter(Fuse<AvroIter>);
 
 #[pymethods]
 impl PyAvroIter {
@@ -121,23 +121,6 @@ impl AvroSource {
                 self.schema = Some(scanner.schema());
             }
             Ok(scanner)
-        }
-    }
-
-    fn get_selection(
-        &self,
-        with_columns: Option<Vec<String>>,
-    ) -> Result<Option<Arc<[usize]>>, Error> {
-        // We must have fetchted the schema before executing this
-        if let Some(cols) = with_columns {
-            let schema = self.schema.as_ref().unwrap();
-            let selection = cols
-                .into_iter()
-                .map(|col| schema.try_index_of(&col).map_err(Error::Polars))
-                .collect::<Result<Vec<_>, Error>>()?;
-            Ok(Some(selection.into()))
-        } else {
-            Ok(None)
         }
     }
 }
@@ -190,32 +173,15 @@ impl AvroSource {
         }))
     }
 
-    // NOTE we split these into two functions, because there's no PyOptExpr
-    #[pyo3(signature = (n_rows, batch_size, with_columns))]
-    fn iter_without_predicate(
+    #[pyo3(signature = (batch_size, with_columns))]
+    #[allow(clippy::needless_pass_by_value)]
+    fn batch_iter(
         &mut self,
-        n_rows: Option<usize>,
         batch_size: usize,
         with_columns: Option<Vec<String>>,
     ) -> PyResult<PyAvroIter> {
         let scanner = self.take_scanner()?;
-        let selection = self.get_selection(with_columns)?;
-        let iter = scanner.into_iter(batch_size, n_rows, None, selection);
-        Ok(PyAvroIter(iter))
-    }
-
-    #[pyo3(signature = (n_rows, batch_size, with_columns, predicate))]
-    fn iter_with_predicate(
-        &mut self,
-        n_rows: Option<usize>,
-        batch_size: usize,
-        with_columns: Option<Vec<String>>,
-        predicate: PyExpr,
-    ) -> PyResult<PyAvroIter> {
-        let PyExpr(expr) = predicate;
-        let scanner = self.take_scanner()?;
-        let selection = self.get_selection(with_columns)?;
-        let iter = scanner.into_iter(batch_size, n_rows, Some(expr), selection);
+        let iter = scanner.try_into_iter(batch_size, with_columns.as_deref())?;
         Ok(PyAvroIter(iter))
     }
 }

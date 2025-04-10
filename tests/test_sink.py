@@ -21,6 +21,16 @@ def test_binary_write() -> None:
     assert frames_equal(frame, duplicate)
 
 
+def test_chunked_binary_write() -> None:
+    """Test writing to a buffer."""
+    buff = BytesIO()
+    frame = pl.from_dict({"x": [1, 2]})
+    write_avro(frame, buff, batch_size=1)
+    buff.seek(0)
+    duplicate = read_avro(buff)
+    assert frames_equal(frame, duplicate)
+
+
 def test_empty_write() -> None:
     """Test writing an empty frame."""
     buff = BytesIO()

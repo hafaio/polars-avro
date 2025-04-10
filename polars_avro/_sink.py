@@ -18,6 +18,7 @@ def write_avro(  # noqa: PLR0913
     frame: DataFrame,
     dest: str | Path | BinaryIO,
     *,
+    batch_size: int | None = None,
     codec: Codec = Codec.Null,
     promote_ints: bool = True,
     promote_array: bool = True,
@@ -60,8 +61,17 @@ def write_avro(  # noqa: PLR0913
         "scan_avro",
     )
 
+    # chunk array if batchsize specified
+    if batch_size is None:
+        frames = [frame]
+    else:
+        frames = [
+            frame[i : i + batch_size].rechunk()
+            for i in range(0, len(frame), batch_size)
+        ]
+
     write_avro_rs(
-        [frame],
+        frames,
         normed,
         codec,
         promote_ints,

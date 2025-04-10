@@ -14,11 +14,11 @@ from ._scan import read_avro, scan_avro
 from ._sink import write_avro
 
 __all__ = (
+    "AvroError",
+    "AvroSpecError",
+    "Codec",
+    "EmptySources",
+    "read_avro",
     "scan_avro",
     "write_avro",
-    "read_avro",
-    "Codec",
-    "AvroError",
-    "EmptySources",
-    "AvroSpecError",
 )

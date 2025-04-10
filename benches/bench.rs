@@ -57,7 +57,7 @@ fn bench_read_polars_avro(b: &mut Bencher) {
                 None,
             )
             .unwrap()
-            .into_iter(1024, None, None, None)
+            .into_iter(1024, None)
             .collect::<Vec<_>>(),
         )
     });

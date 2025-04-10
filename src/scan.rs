@@ -1,6 +1,7 @@
 //! Rust scan implementation
 
 use std::io::Cursor;
+use std::iter::Fuse;
 use std::sync::Arc;
 
 use crate::des::new_value_builder;
@@ -11,7 +12,7 @@ use apache_avro::Reader;
 use apache_avro::types::Value;
 use polars::error::PolarsError;
 use polars::frame::DataFrame;
-use polars::prelude::{Column, CompatLevel, Expr, IntoLazy, Schema as PlSchema};
+use polars::prelude::{Column, CompatLevel, Schema as PlSchema};
 use polars::series::Series;
 use polars_io::cloud::CloudOptions;
 use polars_plan::prelude::ScanSources;
@@ -56,20 +57,16 @@ impl AvroScanner {
     pub fn into_iter(
         self,
         batch_size: usize,
-        n_rows: Option<usize>,
-        predicate: Option<Expr>,
         with_columns: Option<Arc<[usize]>>,
-    ) -> AvroIter {
+    ) -> Fuse<AvroIter> {
         AvroIter {
             reader: self.reader,
             source_iter: self.source_iter,
             schema: self.schema,
             batch_size,
-            n_rows,
-            predicate,
             with_columns,
-            init: true,
         }
+        .fuse()
     }
 
     /// Convert the scanner into an actual iterator
@@ -82,17 +79,15 @@ impl AvroScanner {
     pub fn try_into_iter(
         self,
         batch_size: usize,
-        n_rows: Option<usize>,
-        predicate: Option<Expr>,
         columns: Option<&[impl AsRef<str>]>,
-    ) -> Result<AvroIter, Error> {
+    ) -> Result<Fuse<AvroIter>, Error> {
         let with_columns = if let Some(columns) = columns {
             let indexes = columns
                 .iter()
                 .map(|name| {
-                    self.schema.index_of(name.as_ref()).ok_or_else(|| {
-                        Error::Polars(PolarsError::ColumnNotFound(name.as_ref().to_owned().into()))
-                    })
+                    self.schema
+                        .index_of(name.as_ref())
+                        .ok_or_else(|| PolarsError::ColumnNotFound(name.as_ref().to_owned().into()))
                 })
                 .collect::<Result<_, _>>()?;
             Some(indexes)
@@ -104,11 +99,9 @@ impl AvroScanner {
             source_iter: self.source_iter,
             schema: self.schema,
             batch_size,
-            n_rows,
-            predicate,
             with_columns,
-            init: true,
-        })
+        }
+        .fuse())
     }
 }
 
@@ -118,23 +111,12 @@ pub struct AvroIter {
     source_iter: SourceIter,
     schema: Arc<PlSchema>,
     batch_size: usize,
-    n_rows: Option<usize>,
-    predicate: Option<Expr>,
     with_columns: Option<Arc<[usize]>>,
-    /// Marker for if we've returned any values so we can make sure to at least once
-    // TODO remove when empty iterators are supported
-    init: bool,
 }
 
 impl AvroIter {
-    /// Get the schema
-    pub fn schema(&self) -> Arc<PlSchema> {
-        self.schema.clone()
-    }
-
     fn read_columns(
         &mut self,
-        mut num_to_read: usize,
         with_columns: impl IntoIterator<Item = usize> + Clone,
     ) -> Result<Vec<Column>, Error> {
         let compat = CompatLevel::newest();
@@ -145,11 +127,11 @@ impl AvroIter {
             .map(|idx| {
                 // already checked that idx valid for schema
                 let (_, dtype) = self.schema.get_at_index(idx).unwrap();
-                new_value_builder(&dtype.to_arrow(compat), num_to_read)
+                new_value_builder(&dtype.to_arrow(compat), self.batch_size)
             })
             .collect();
 
-        while num_to_read > 0 {
+        for _ in 0..self.batch_size {
             if let Some(rec) = self.reader.next() {
                 let val = rec?;
                 if let Value::Record(rec_val) = val {
@@ -160,7 +142,6 @@ impl AvroIter {
                 } else {
                     unreachable!("top level schema validated as a record schema");
                 }
-                num_to_read -= 1;
             } else if let Some(source) = self.source_iter.next() {
                 self.reader = Reader::new(source?)?;
                 // NOTE we could be lazy and just check compatability, but
@@ -173,8 +154,7 @@ impl AvroIter {
                     return Err(Error::NonMatchingSchemas);
                 }
             } else {
-                num_to_read = 0;
-                self.batch_size = 0; // force early termination
+                break;
             }
         }
 
@@ -194,31 +174,15 @@ impl AvroIter {
             .collect())
     }
 
-    fn read_frame(&mut self, num_to_read: usize) -> Result<DataFrame, Error> {
+    fn read_frame(&mut self) -> Result<DataFrame, Error> {
         let columns = if let Some(with_columns) = &self.with_columns {
             let cols = with_columns.clone();
-            self.read_columns(num_to_read, cols.iter().copied())?
+            self.read_columns(cols.iter().copied())?
         } else {
-            self.read_columns(num_to_read, 0..self.schema.len())?
+            self.read_columns(0..self.schema.len())?
         };
 
-        let res = DataFrame::new(columns).map_err(Error::Polars)?;
-
-        // subtract off read rows
-        if let Some(num_to_read) = &mut self.n_rows {
-            *num_to_read -= res.height();
-        }
-
-        // apply predicate pushdown
-        if let Some(predicate) = &self.predicate {
-            res.lazy()
-                .filter(predicate.clone())
-                ._with_eager(true)
-                .collect()
-                .map_err(Error::Polars)
-        } else {
-            Ok(res)
-        }
+        Ok(DataFrame::new(columns)?)
     }
 }
 
@@ -226,17 +190,9 @@ impl Iterator for AvroIter {
     type Item = Result<DataFrame, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let num_to_read = usize::min(self.n_rows.unwrap_or(self.batch_size), self.batch_size);
-        if num_to_read > 0 || self.init {
-            match self.read_frame(num_to_read) {
-                Ok(frame) if frame.is_empty() && !self.init => None,
-                res => {
-                    self.init = false;
-                    Some(res)
-                }
-            }
-        } else {
-            None
+        match self.read_frame() {
+            Ok(frame) if frame.is_empty() => None,
+            res => Some(res),
         }
     }
 }
@@ -273,7 +229,7 @@ mod tests {
 
     fn read_scan(scanner: AvroScanner) -> DataFrame {
         let frames: Vec<_> = scanner
-            .into_iter(1024, None, None, None)
+            .into_iter(1024, None)
             .map(|part| part.unwrap().lazy())
             .collect();
         concat(frames, UnionArgs::default())

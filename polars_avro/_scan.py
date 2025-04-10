@@ -77,16 +77,18 @@ def scan_avro(  # noqa: PLR0913
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[DataFrame]:
-        if predicate is not None:
-            avro_iter = src.iter_with_predicate(
-                n_rows, batch_size or def_batch_size, with_columns, predicate
-            )
-        else:
-            avro_iter = src.iter_without_predicate(
-                n_rows, batch_size or def_batch_size, with_columns
-            )
+        avro_iter = src.batch_iter(batch_size or def_batch_size, with_columns)
         while (batch := avro_iter.next()) is not None:
-            yield batch
+            if predicate is not None:
+                batch = batch.filter(predicate)  # type: ignore
+            if n_rows is None:
+                yield batch
+            else:
+                batch = batch[:n_rows]
+                n_rows -= len(batch)
+                yield batch
+                if n_rows == 0:
+                    break
 
     return register_io_source(source_generator, schema=lambda: pl.Schema(src.schema()))
 

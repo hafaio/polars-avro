@@ -62,8 +62,7 @@ pub fn sink_avro(
             if part.schema() == &schema {
                 let mut row = Row(vec![AnyValue::Null; part.width()]);
                 for idx in 0..part.height() {
-                    part.get_row_amortized(idx, &mut row)
-                        .map_err(Error::Polars)?;
+                    part.get_row_amortized(idx, &mut row)?;
                     let Row(record) = &row;
                     writer.append(ser::try_as_value(&schema, record)?)?;
                 }

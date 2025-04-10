@@ -77,7 +77,7 @@ benchmark results.
 
 ```sh
 cargo fmt --check
-cargo +nightly clippy --all-features
+cargo clippy --all-features
 cargo test
 uv run ruff format --check
 uv run ruff check

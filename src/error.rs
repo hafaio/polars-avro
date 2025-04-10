@@ -14,13 +14,13 @@ pub enum Error {
     /// An error from polars
     Polars(PolarsError),
     /// An error propogated from the underlying avro library
-    Avro(Box<AvroError>),
+    Avro(Box<AvroError>), // NOTE AvroErrors are big!
     /// Cannot scan empty sources
     EmptySources,
     /// Top level avro schema must be a record
-    NonRecordSchema(Box<Schema>),
+    NonRecordSchema(Box<Schema>), // NOTE AvroSchema's are big!
     /// Avro and arrow don't share the same types
-    UnsupportedAvroType(Box<Schema>),
+    UnsupportedAvroType(Box<Schema>), // NOTE AvroSchema's are big!
     /// Avro and arrow don't share the same types and this type can't be cnverted
     ///
     /// There are options for sink that allow promotion or truncation that alter
@@ -85,6 +85,12 @@ impl StdError for Error {}
 impl From<AvroError> for Error {
     fn from(value: AvroError) -> Self {
         Self::Avro(Box::new(value))
+    }
+}
+
+impl From<PolarsError> for Error {
+    fn from(value: PolarsError) -> Self {
+        Self::Polars(value)
     }
 }
 

@@ -38,27 +38,22 @@ impl SourceIter {
             include_file_paths: None,
             allow_missing_columns: false,
         };
-        let sources = sources
-            .expand_paths(&scan_options, cloud_options)
-            .map_err(Error::Polars)?;
+        let sources = sources.expand_paths(&scan_options, cloud_options)?;
 
         // cache cloud files
         let are_cloud_urls = sources.is_cloud_url();
         let cache_entries = {
             if are_cloud_urls {
-                Some(
-                    polars_io::file_cache::init_entries_from_uri_list(
-                        sources
-                            .as_paths()
-                            .unwrap()
-                            .iter()
-                            .map(|path| Arc::from(path.to_str().unwrap()))
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                        cloud_options,
-                    )
-                    .map_err(Error::Polars)?,
-                )
+                Some(polars_io::file_cache::init_entries_from_uri_list(
+                    sources
+                        .as_paths()
+                        .unwrap()
+                        .iter()
+                        .map(|path| Arc::from(path.to_str().unwrap()))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    cloud_options,
+                )?)
             } else {
                 None
             }
@@ -81,9 +76,11 @@ impl Iterator for SourceIter {
         let source = self.sources.get(self.idx);
         self.idx += 1;
         source.map(|source| {
-            let memslice = source
-                .to_memslice_possibly_async(self.are_cloud_urls, self.cache_entries.as_ref(), 0)
-                .map_err(Error::Polars)?;
+            let memslice = source.to_memslice_possibly_async(
+                self.are_cloud_urls,
+                self.cache_entries.as_ref(),
+                0,
+            )?;
             Ok(Cursor::new(memslice))
         })
     }
