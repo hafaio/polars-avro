@@ -1,6 +1,6 @@
 # polars-avro
 
-[![build](https://github.com/hafaio/polars-avro/actions/workflows/python-package.yml/badge.svg)](https://github.com/hafaio/polars-avro/actions/workflows/python-package.yml)
+[![build](https://github.com/hafaio/polars-avro/actions/workflows/build.yml/badge.svg)](https://github.com/hafaio/polars-avro/actions/workflows/build.yml)
 [![pypi](https://img.shields.io/pypi/v/polars-avro)](https://pypi.org/project/polars-avro/)
 [![docs](https://img.shields.io/badge/api-docs-blue)](https://hafaio.github.io/polars-avro)
 
