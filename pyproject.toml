@@ -4,12 +4,7 @@ version = "0.2.0"
 description = "Polars io-plugin for reading and writing avro files"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "maturin>=1.8.2",
-    "polars>=1.20.0",
-    "pyarrow>=19.0.1",
-    "ruff>=0.11.4",
-]
+dependencies = ["maturin>=1.8.2", "polars>=1.20.0", "pyarrow>=19.0.1"]
 
 [dependency-groups]
 dev = [
@@ -18,9 +13,10 @@ dev = [
     "myst-parser>=4.0.1",
     "nbformat>=5.10.4",
     "pyright>=1.1.398",
-    "pytest>=8.3.5",
     "pytest-benchmark>=5.1.0",
     "pytest-cov>=6.0.0",
+    "pytest>=8.3.5",
+    "ruff>=0.11.4",
     "sphinx>=8.1.3",
 ]
 
