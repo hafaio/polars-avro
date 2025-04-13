@@ -97,10 +97,8 @@ impl From<PolarsError> for Error {
 #[cfg(test)]
 mod tests {
     use apache_avro::{Error as AvroError, Schema, types::Value};
-    use polars::{
-        error::PolarsError,
-        prelude::{ArrowDataType, DataType},
-    };
+    use polars::error::PolarsError;
+    use polars::prelude::{ArrowDataType, DataType};
 
     use super::Error;
 

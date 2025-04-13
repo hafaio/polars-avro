@@ -16,7 +16,7 @@ from ._avro_rs import AvroSource
 def scan_avro(  # noqa: PLR0913
     sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
     *,
-    batch_size: int = 1024,
+    batch_size: int = 32768,
     glob: bool = True,
     storage_options: Mapping[str, str] | None = None,
     credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
@@ -101,7 +101,7 @@ def read_avro(  # noqa: PLR0913
     row_index_name: str | None = None,
     row_index_offset: int = 0,
     rechunk: bool = False,
-    batch_size: int = 1024,
+    batch_size: int = 32768,
     glob: bool = True,
     storage_options: Mapping[str, str] | None = None,
     credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
