@@ -1,11 +1,11 @@
 use std::io::Cursor;
 
-use crate::{AvroScanner, Codec, WriteOptions, sink_avro};
+use crate::{AvroScanner, Codec, Error, WriteOptions, sink_avro};
 use chrono::{NaiveDate, NaiveTime};
+use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
-    DataFrame, DataType, IntoLazy, Series, TimeUnit, UnionArgs, as_struct, col, concat,
-    create_enum_dtype, df,
+    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs,
 };
 use polars_arrow::array::{MutableArray, Utf8ViewArray};
 use polars_plan::plans::ScanSources;
@@ -18,7 +18,7 @@ fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
 }
 
 fn deserialize(buff: Vec<u8>) -> DataFrame {
-    let sources = ScanSources::Buffers(vec![MemSlice::from_vec(buff)].into_boxed_slice().into());
+    let sources = ScanSources::Buffers(vec![MemSlice::from_vec(buff)].into());
     let scanner = AvroScanner::new_from_sources(&sources, false, None).unwrap();
     let schema = scanner.schema();
     let iter = scanner.into_iter(2, None);
@@ -26,7 +26,7 @@ fn deserialize(buff: Vec<u8>) -> DataFrame {
     if parts.is_empty() {
         DataFrame::empty_with_schema(&schema)
     } else {
-        concat(parts, UnionArgs::default())
+        pl::concat(parts, UnionArgs::default())
             .unwrap()
             .collect()
             .unwrap()
@@ -38,7 +38,7 @@ fn test_transitivity() {
     // create data
     let frame: DataFrame = df!(
         "name" => [Some("Alice Archer"), Some("Ben Brown"), Some("Chloe Cooper"), None],
-        "weight" => [None, Some(72.5), Some(53.6), Some(83.1)],
+        "weight" => [None, Some(72.5), Some(53.6), None],
         "height" => [Some(1.56_f32), None, Some(1.65_f32), Some(1.75_f32)],
         "birthtime" => [
             Some(NaiveDate::from_ymd_opt(1997, 1, 10).unwrap().and_hms_nano_opt(1, 2, 3, 1_002_003).unwrap()),
@@ -55,12 +55,16 @@ fn test_transitivity() {
         "rating" => [None, Some("mid"), Some("slay"), Some("slay")],
     )
     .unwrap().lazy().with_columns([
-        as_struct(vec![col("name"), col("age")]).alias("combined"),
-        col("birthtime").strict_cast(DataType::Date).alias("birthdate"),
-        col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, None)).alias("birthtime_milli"),
-        col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, None)).alias("birthtime_micro"),
-        col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, None)).alias("birthtime_nano"),
-        col("rating").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values(["mid", "slay"]))),
+        pl::when(pl::col("name") == "Alice Archer".into()).then(pl::lit(Null {})).otherwise(pl::as_struct(vec![pl::col("name"), pl::col("age")])).alias("combined"),
+        pl::col("birthtime").strict_cast(DataType::Date).alias("birthdate"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))).alias("birthtime_milli"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))).alias("birthtime_micro"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into()))).alias("birthtime_nano"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, None)).alias("birthtime_milli_local"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, None)).alias("birthtime_micro_local"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, None)).alias("birthtime_nano_local"),
+        pl::col("rating").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values(["mid", "slay"]))),
+        pl::col("height").strict_cast(DataType::Decimal(Some(15), Some(2))).alias("decimal"),
     ]).collect().unwrap();
 
     // write / read
@@ -89,7 +93,7 @@ fn test_promotion_truncation() {
             NaiveTime::from_hms_nano_opt(10, 11, 12, 4_004).unwrap(),
         ],
     )
-    .unwrap().lazy().with_column(col("arr").strict_cast(DataType::Array(Box::new(DataType::Int32), 3))).collect().unwrap();
+    .unwrap().lazy().with_column(pl::col("arr").strict_cast(DataType::Array(Box::new(DataType::Int32), 3))).collect().unwrap();
 
     let reconstruction = deserialize(serialize(
         frame.clone(),
@@ -104,9 +108,10 @@ fn test_promotion_truncation() {
     let promoted = frame
         .lazy()
         .select([
-            col("ints").strict_cast(DataType::Int32),
-            col("arr").strict_cast(DataType::List(Box::new(DataType::Int32))),
-            (col("time").cast(DataType::Int64) / 1000.into() * 1000.into()).cast(DataType::Time), // truncate to micro seconds
+            pl::col("ints").strict_cast(DataType::Int32),
+            pl::col("arr").strict_cast(DataType::List(Box::new(DataType::Int32))),
+            (pl::col("time").cast(DataType::Int64) / 1000.into() * 1000.into())
+                .cast(DataType::Time), // truncate to micro seconds
         ])
         .collect()
         .unwrap();
@@ -134,4 +139,28 @@ fn test_empty() {
     ));
 
     assert_eq!(frame, reconstruction);
+}
+
+#[test]
+fn test_different_schemas() {
+    let one = serialize(
+        df! {
+            "x" => [1, 2, 3]
+        }
+        .unwrap(),
+        WriteOptions::default(),
+    );
+    let two = serialize(
+        df! {
+            "y" => ["a", "b", "c"]
+        }
+        .unwrap(),
+        WriteOptions::default(),
+    );
+
+    let sources = ScanSources::Buffers(vec![one.into(), two.into()].into());
+    let scanner = AvroScanner::new_from_sources(&sources, false, None).unwrap();
+    let iter = scanner.into_iter(2, None);
+    let parts: Result<Vec<_>, _> = iter.map(|part| part).collect();
+    assert!(matches!(parts, Err(Error::NonMatchingSchemas)));
 }

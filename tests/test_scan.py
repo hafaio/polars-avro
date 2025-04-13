@@ -4,6 +4,7 @@ from io import BytesIO
 from typing import NoReturn
 from unittest.mock import patch
 
+import fastavro
 import polars as pl
 import pytest
 from polars.io.cloud.credential_provider._builder import (
@@ -176,6 +177,30 @@ def test_scan_in_memory() -> None:
     assert frames_equal(pl.concat([frame, frame]).slice(-4, 3), scanned)
 
 
+def test_read_map_type() -> None:
+    """Test that we can read a map type."""
+    buff = BytesIO()
+    values = [{"map": {"a": 5}}, {"map": None}, {"map": {"c": 8, "f": -10}}]
+    fastavro.writer(  # type: ignore
+        buff,
+        {
+            "type": "record",
+            "name": "map_test",
+            "fields": [
+                {"name": "map", "type": ["null", {"type": "map", "values": "int"}]}
+            ],
+        },
+        values,
+    )
+    buff.seek(0)
+    res = read_avro(buff)
+    expected = pl.from_dict(
+        {"map": [[["a", 5]], None, [["c", 8], ["f", -10]]]},
+        schema={"map": pl.List(pl.Struct({"key": pl.String, "value": pl.Int32}))},
+    )
+    assert frames_equal(res, expected)
+
+
 def test_read_options() -> None:
     """Test read works with options."""
     frame = read_avro(
@@ -183,17 +208,6 @@ def test_read_options() -> None:
     )
     assert frame.shape == (11, 2)
     assert frame["row_index"].to_list() == [*range(11)]
-
-
-@pytest.mark.xfail(reason="fast count not implemented for plugins")
-def test_count() -> None:
-    """Test that count is pushed down."""
-    lazy = scan_avro("resources/food.avro").select(pl.len())
-    expected = scan_avro("resources/food.avro").collect().select(pl.len())
-
-    # Check if we are using our fast count star
-    assert "FAST COUNT" in lazy.explain()
-    assert frames_equal(lazy.collect(), expected)
 
 
 def test_filename_in_err() -> None:

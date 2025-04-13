@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use super::Error;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{
-    EnumSchema, Name, RecordField, RecordFieldOrder, RecordSchema, UnionSchema,
+    DecimalSchema, EnumSchema, FixedSchema, Name, RecordField, RecordFieldOrder, RecordSchema,
+    UnionSchema,
 };
 use apache_avro::types::Value;
-use polars::prelude::{AnyValue, DataType, Schema as PlSchema, TimeUnit};
+use polars::prelude::{AnyValue, DataType, Field, RevMapping, Schema as PlSchema, TimeUnit};
 
 pub fn try_as_schema(
     schema: &PlSchema,
@@ -59,10 +60,74 @@ struct Serializer {
     truncate_time: bool,
 }
 
+fn create_enum_schema(rev_mapping: &RevMapping) -> Result<EnumSchema, Error> {
+    Ok(EnumSchema {
+        name: "polars_avro_enum".into(),
+        aliases: None,
+        doc: None,
+        symbols: rev_mapping
+            .get_categories()
+            .iter()
+            .map(|val| val.map(str::to_string).ok_or(Error::NullEnum))
+            .collect::<Result<_, _>>()?,
+        default: None,
+        attributes: BTreeMap::new(),
+    })
+}
+
+fn create_decimal_schema(precision: usize, scale: usize) -> DecimalSchema {
+    DecimalSchema {
+        precision,
+        scale,
+        inner: Box::new(AvroSchema::Fixed(FixedSchema {
+            name: "polars_avro_decimal".into(),
+            aliases: None,
+            doc: None,
+            size: 16, // polars uses i128s so this is the max size
+            default: None,
+            attributes: BTreeMap::new(),
+        })),
+    }
+}
+
 impl Serializer {
+    fn create_record_schema(&self, fields: &[Field]) -> Result<RecordSchema, Error> {
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| {
+                Ok(RecordField {
+                    name: field.name.as_str().into(),
+                    doc: None,
+                    aliases: None,
+                    default: None,
+                    schema: self.try_as_schema(field.dtype())?,
+                    order: RecordFieldOrder::Ignore,
+                    position: idx,
+                    custom_attributes: BTreeMap::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let lookup: BTreeMap<_, _> = fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (field.name.as_str().to_string(), idx))
+            .collect();
+        Ok(RecordSchema {
+            name: Name {
+                name: "polars_avro_record".into(),
+                namespace: None,
+            },
+            aliases: None,
+            doc: None,
+            fields,
+            lookup,
+            attributes: BTreeMap::new(),
+        })
+    }
+
     fn try_as_schema(&self, dtype: &DataType) -> Result<AvroSchema, Error> {
         let base = match dtype {
-            // NOTE null is just null
             DataType::Null => return Ok(AvroSchema::Null),
             DataType::Boolean => AvroSchema::Boolean,
             DataType::Int8 | DataType::Int16 | DataType::UInt8 | DataType::UInt16
@@ -75,12 +140,24 @@ impl Serializer {
             DataType::Int64 => AvroSchema::Long,
             DataType::Float32 => AvroSchema::Float,
             DataType::Float64 => AvroSchema::Double,
+            &DataType::Decimal(Some(precision), Some(scale)) => {
+                AvroSchema::Decimal(create_decimal_schema(precision, scale))
+            }
             DataType::String => AvroSchema::String,
             DataType::Binary => AvroSchema::Bytes,
             DataType::Date => AvroSchema::Date,
-            DataType::Datetime(TimeUnit::Milliseconds, _) => AvroSchema::TimestampMillis,
-            DataType::Datetime(TimeUnit::Microseconds, _) => AvroSchema::TimestampMicros,
-            DataType::Datetime(TimeUnit::Nanoseconds, _) => AvroSchema::TimestampNanos,
+            DataType::Datetime(TimeUnit::Milliseconds, Some(tz)) if tz == "UTC" => {
+                AvroSchema::TimestampMillis
+            }
+            DataType::Datetime(TimeUnit::Microseconds, Some(tz)) if tz == "UTC" => {
+                AvroSchema::TimestampMicros
+            }
+            DataType::Datetime(TimeUnit::Nanoseconds, Some(tz)) if tz == "UTC" => {
+                AvroSchema::TimestampNanos
+            }
+            DataType::Datetime(TimeUnit::Milliseconds, None) => AvroSchema::LocalTimestampMillis,
+            DataType::Datetime(TimeUnit::Microseconds, None) => AvroSchema::LocalTimestampMicros,
+            DataType::Datetime(TimeUnit::Nanoseconds, None) => AvroSchema::LocalTimestampNanos,
             DataType::Time if self.truncate_time => AvroSchema::TimeMicros,
             DataType::Array(elem_type, _) if self.promote_array => {
                 AvroSchema::array(self.try_as_schema(elem_type)?)
@@ -88,56 +165,13 @@ impl Serializer {
             DataType::List(elem_type) => AvroSchema::array(self.try_as_schema(elem_type)?),
             DataType::Categorical(rev_mapping, _) | DataType::Enum(rev_mapping, _) => {
                 if let Some(rev_mapping) = rev_mapping {
-                    AvroSchema::Enum(EnumSchema {
-                        name: "polars_avro_enum".into(),
-                        aliases: None,
-                        doc: None,
-                        symbols: rev_mapping
-                            .get_categories()
-                            .iter()
-                            .map(|val| val.map(str::to_string).ok_or(Error::NullEnum))
-                            .collect::<Result<_, _>>()?,
-                        default: None,
-                        attributes: BTreeMap::new(),
-                    })
+                    AvroSchema::Enum(create_enum_schema(rev_mapping)?)
                 } else {
                     return Err(Error::NullEnum);
                 }
             }
-            DataType::Struct(fields) => {
-                let fields = fields
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, field)| {
-                        Ok(RecordField {
-                            name: field.name.as_str().into(),
-                            doc: None,
-                            aliases: None,
-                            default: None,
-                            schema: self.try_as_schema(field.dtype())?,
-                            order: RecordFieldOrder::Ignore,
-                            position: idx,
-                            custom_attributes: BTreeMap::new(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                let lookup: BTreeMap<_, _> = fields
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, field)| (field.name.as_str().to_string(), idx))
-                    .collect();
-                AvroSchema::Record(RecordSchema {
-                    name: Name {
-                        name: "polars_avro_record".into(),
-                        namespace: None,
-                    },
-                    aliases: None,
-                    doc: None,
-                    fields,
-                    lookup,
-                    attributes: BTreeMap::new(),
-                })
-            }
+            DataType::Struct(fields) => AvroSchema::Record(self.create_record_schema(fields)?),
+            // wildcard to cover different features
             _ => return Err(Error::UnsupportedPolarsType(dtype.clone())),
         };
         Ok(AvroSchema::Union(UnionSchema::new(vec![
@@ -180,19 +214,40 @@ fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
             &AnyValue::Int16(val) => Value::Int(i32::from(val)),
             &AnyValue::Int32(val) => Value::Int(val),
             &AnyValue::Int64(val) => Value::Long(val),
+            AnyValue::Decimal(val, _) => Value::Decimal(val.to_be_bytes().into()),
             &AnyValue::Float32(val) => Value::Float(val),
             &AnyValue::Float64(val) => Value::Double(val),
             &AnyValue::Date(val) => Value::Date(val),
-            &AnyValue::Datetime(val, TimeUnit::Milliseconds, _)
-            | &AnyValue::DatetimeOwned(val, TimeUnit::Milliseconds, _) => {
+            &AnyValue::Datetime(val, TimeUnit::Milliseconds, Some(tz)) if tz == "UTC" => {
                 Value::TimestampMillis(val)
             }
-            &AnyValue::Datetime(val, TimeUnit::Microseconds, _)
-            | &AnyValue::DatetimeOwned(val, TimeUnit::Microseconds, _) => {
+            AnyValue::DatetimeOwned(val, TimeUnit::Milliseconds, Some(tz)) if **tz == "UTC" => {
+                Value::TimestampMillis(*val)
+            }
+            &AnyValue::Datetime(val, TimeUnit::Microseconds, Some(tz)) if tz == "UTC" => {
                 Value::TimestampMicros(val)
             }
-            &AnyValue::Datetime(val, TimeUnit::Nanoseconds, _)
-            | &AnyValue::DatetimeOwned(val, TimeUnit::Nanoseconds, _) => Value::TimestampNanos(val),
+            AnyValue::DatetimeOwned(val, TimeUnit::Microseconds, Some(tz)) if **tz == "UTC" => {
+                Value::TimestampMicros(*val)
+            }
+            &AnyValue::Datetime(val, TimeUnit::Nanoseconds, Some(tz)) if tz == "UTC" => {
+                Value::TimestampNanos(val)
+            }
+            AnyValue::DatetimeOwned(val, TimeUnit::Nanoseconds, Some(tz)) if **tz == "UTC" => {
+                Value::TimestampNanos(*val)
+            }
+            &AnyValue::Datetime(val, TimeUnit::Milliseconds, None)
+            | &AnyValue::DatetimeOwned(val, TimeUnit::Milliseconds, None) => {
+                Value::LocalTimestampMillis(val)
+            }
+            &AnyValue::Datetime(val, TimeUnit::Microseconds, None)
+            | &AnyValue::DatetimeOwned(val, TimeUnit::Microseconds, None) => {
+                Value::LocalTimestampMicros(val)
+            }
+            &AnyValue::Datetime(val, TimeUnit::Nanoseconds, None)
+            | &AnyValue::DatetimeOwned(val, TimeUnit::Nanoseconds, None) => {
+                Value::LocalTimestampNanos(val)
+            }
             &AnyValue::Time(val) => Value::TimeMicros((val + 500) / 1000),
             &AnyValue::Categorical(val, rev_mapping, _) | &AnyValue::Enum(val, rev_mapping, _) => {
                 Value::Enum(val, rev_mapping.get(val).to_owned())
