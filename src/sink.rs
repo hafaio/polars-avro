@@ -79,7 +79,8 @@ pub fn sink_avro(
 #[cfg(test)]
 mod tests {
     use chrono::NaiveTime;
-    use polars::prelude::{DataType, IntoLazy, Series, col, df};
+    use polars::df;
+    use polars::prelude::{self as pl, DataType, IntoLazy, Series};
     use std::io::Cursor;
 
     use super::WriteOptions;
@@ -160,7 +161,7 @@ mod tests {
                 "a" => [Series::from_iter([1, 2, 3]), Series::from_iter([4, 5, 6]), Series::from_iter([7, 8, 9]), Series::from_iter([10, 11, 12])],
             }
             .unwrap()
-            .lazy().with_column(col("a").strict_cast(DataType::Array(Box::new(DataType::Int32), 3))).collect().unwrap()],
+            .lazy().with_column(pl::col("a").strict_cast(DataType::Array(Box::new(DataType::Int32), 3))).collect().unwrap()],
             dest,
             WriteOptions {
                 promote_array: true,

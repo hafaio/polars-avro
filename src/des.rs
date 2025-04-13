@@ -4,6 +4,9 @@ use std::any::Any;
 
 use super::Error;
 use apache_avro::Schema as AvroSchema;
+use apache_avro::schema::{
+    ArraySchema, DecimalSchema, EnumSchema, MapSchema, RecordField, RecordSchema,
+};
 use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
 use polars::prelude::{
@@ -14,6 +17,9 @@ use polars_arrow::array::{
     MutableNullArray, MutablePrimitiveArray, StructArray, TryExtend, TryPush, Utf8ViewArray,
 };
 use polars_arrow::bitmap::MutableBitmap;
+
+const KEY_FIELD: &str = "key";
+const VALUE_FIELD: &str = "value";
 
 pub fn try_from_schema(schema: &AvroSchema) -> Result<PlSchema, Error> {
     if let AvroSchema::Record(rec) = schema {
@@ -33,73 +39,72 @@ pub fn try_from_schema(schema: &AvroSchema) -> Result<PlSchema, Error> {
 }
 
 fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
-    match schema {
-        AvroSchema::Null => Ok(DataType::Null),
-        AvroSchema::Boolean => Ok(DataType::Boolean),
-        AvroSchema::Int => Ok(DataType::Int32),
-        AvroSchema::Long => Ok(DataType::Int64),
-        AvroSchema::Float => Ok(DataType::Float32),
-        AvroSchema::Double => Ok(DataType::Float64),
-        AvroSchema::Bytes => Ok(DataType::Binary),
-        AvroSchema::String => Ok(DataType::String),
-        AvroSchema::Array(array_schema) => Ok(DataType::List(Box::new(try_from_dtype(
-            &array_schema.items,
-        )?))),
-        AvroSchema::Record(record_schema) => Ok(DataType::Struct(
-            record_schema
-                .fields
+    Ok(match schema {
+        AvroSchema::Null => DataType::Null,
+        AvroSchema::Boolean => DataType::Boolean,
+        AvroSchema::Int => DataType::Int32,
+        AvroSchema::Long => DataType::Int64,
+        AvroSchema::Float => DataType::Float32,
+        AvroSchema::Double => DataType::Float64,
+        AvroSchema::Bytes | AvroSchema::Uuid | AvroSchema::Fixed(_) => DataType::Binary,
+        AvroSchema::String => DataType::String,
+        AvroSchema::Array(ArraySchema { items, .. }) => {
+            DataType::List(Box::new(try_from_dtype(items)?))
+        }
+        AvroSchema::Record(RecordSchema { fields, .. }) => DataType::Struct(
+            fields
                 .iter()
-                .map(|field| {
+                .map(|RecordField { name, schema, .. }| {
                     Ok(Field {
-                        name: field.name.as_str().into(),
-                        dtype: try_from_dtype(&field.schema)?,
+                        name: name.as_str().into(),
+                        dtype: try_from_dtype(schema)?,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
-        )),
-        AvroSchema::Enum(enum_schema) => Ok(create_enum_dtype(Utf8ViewArray::from_slice_values(
-            &enum_schema.symbols,
-        ))),
-        AvroSchema::Date => Ok(DataType::Date),
-        AvroSchema::TimeMillis | AvroSchema::TimeMicros => Ok(DataType::Time),
-        AvroSchema::TimestampMillis => Ok(DataType::Datetime(TimeUnit::Milliseconds, None)),
-        AvroSchema::TimestampMicros => Ok(DataType::Datetime(TimeUnit::Microseconds, None)),
-        AvroSchema::TimestampNanos => Ok(DataType::Datetime(TimeUnit::Nanoseconds, None)),
-        AvroSchema::Union(union) => {
-            let mut variants = union
-                .variants()
-                .iter()
-                .filter(|var| !matches!(var, AvroSchema::Null));
-            if union.variants().is_empty() {
-                Err(Error::UnsupportedAvroType(Box::new(schema.clone())))
-            } else if let Some(rem) = variants.next() {
-                if variants.next().is_some() {
-                    // union with more than 1 non-null element
-                    Err(Error::UnsupportedAvroType(Box::new(schema.clone())))
-                } else {
-                    // else try again on non-union
-                    try_from_dtype(rem)
-                }
-            } else {
-                // must have removed null, so return null
-                Ok(DataType::Null)
-            }
+        ),
+        AvroSchema::Enum(EnumSchema { symbols, .. }) => {
+            create_enum_dtype(Utf8ViewArray::from_slice_values(symbols))
         }
-        AvroSchema::Map(_)
-        | AvroSchema::Fixed(_)
-        | AvroSchema::Decimal(_)
-        | AvroSchema::BigDecimal
-        | AvroSchema::Uuid
-        | AvroSchema::LocalTimestampMillis
-        | AvroSchema::LocalTimestampMicros
-        | AvroSchema::LocalTimestampNanos
-        | AvroSchema::Duration
-        | AvroSchema::Ref { .. } => Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
-    }
+        AvroSchema::Date => DataType::Date,
+        AvroSchema::TimeMillis | AvroSchema::TimeMicros => DataType::Time,
+        AvroSchema::TimestampMillis => {
+            DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))
+        }
+        AvroSchema::TimestampMicros => {
+            DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))
+        }
+        AvroSchema::TimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into())),
+        AvroSchema::LocalTimestampMillis => DataType::Datetime(TimeUnit::Milliseconds, None),
+        AvroSchema::LocalTimestampMicros => DataType::Datetime(TimeUnit::Microseconds, None),
+        AvroSchema::LocalTimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, None),
+        AvroSchema::Union(union) => match union.variants() {
+            [AvroSchema::Null, other] | [other, AvroSchema::Null] | [other] => {
+                try_from_dtype(other)?
+            }
+            _ => return Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
+        },
+        AvroSchema::Map(MapSchema { types, .. }) => {
+            DataType::List(Box::new(DataType::Struct(vec![
+                Field::new(KEY_FIELD.into(), DataType::String),
+                Field::new(VALUE_FIELD.into(), try_from_dtype(types)?),
+            ])))
+        }
+        &AvroSchema::Decimal(DecimalSchema {
+            precision, scale, ..
+        }) => DataType::Decimal(Some(precision), Some(scale)),
+        AvroSchema::BigDecimal | AvroSchema::Duration | AvroSchema::Ref { .. } => {
+            return Err(Error::UnsupportedAvroType(Box::new(schema.clone())));
+        }
+    })
 }
 
 pub trait ValueBuilder: MutableArray {
     fn try_push_value(&mut self, value: &Value) -> PolarsResult<()>;
+
+    // NOTE this so maps can be deserialized as lists of structs without copies
+    fn try_push_keyed_value(&mut self, _: &String, _: &Value) -> PolarsResult<()> {
+        unreachable!();
+    }
 }
 
 impl MutableArray for Box<dyn ValueBuilder> {
@@ -143,6 +148,10 @@ impl MutableArray for Box<dyn ValueBuilder> {
 impl ValueBuilder for Box<dyn ValueBuilder> {
     fn try_push_value(&mut self, value: &Value) -> PolarsResult<()> {
         self.as_mut().try_push_value(value)
+    }
+
+    fn try_push_keyed_value(&mut self, key: &String, value: &Value) -> PolarsResult<()> {
+        self.as_mut().try_push_keyed_value(key, value)
     }
 }
 
@@ -202,7 +211,8 @@ impl ValueBuilder for MutableBinaryViewArray<[u8]> {
     fn try_push_value(&mut self, value: &Value) -> PolarsResult<()> {
         match unwrap_union(value) {
             Value::Null => self.push_null(),
-            Value::Bytes(val) => self.push_value(val),
+            Value::Bytes(val) | Value::Fixed(_, val) => self.push_value(val),
+            Value::Uuid(val) => self.push_value(val.as_bytes()),
             _ => {
                 return Err(PolarsError::SchemaMismatch(
                     format!("expected bytes but got {value:?}").into(),
@@ -233,14 +243,47 @@ impl ValueBuilder for MutablePrimitiveArray<i64> {
         match unwrap_union(value) {
             Value::Null => self.push_null(),
             &Value::Long(val)
-            // NOTE for these we preserve the unit so no conversion is necessary
+            | &Value::LocalTimestampNanos(val)
+            | &Value::LocalTimestampMicros(val)
+            | &Value::LocalTimestampMillis(val)
             | &Value::TimestampNanos(val)
             | &Value::TimestampMicros(val)
             | &Value::TimestampMillis(val) => self.push_value(val),
             // NOTE arrow only supports time in nano, so we must scale up
             &Value::TimeMicros(val) => self.push_value(val * 1_000),
             &Value::TimeMillis(val) => self.push_value(i64::from(val) * 1_000_000),
-            _ => return Err(PolarsError::SchemaMismatch(format!("expected long, timestamp, or time but got {value:?}").into())),
+            _ => {
+                return Err(PolarsError::SchemaMismatch(
+                    format!("expected long, timestamp, or time but got {value:?}").into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ValueBuilder for MutablePrimitiveArray<i128> {
+    fn try_push_value(&mut self, value: &Value) -> PolarsResult<()> {
+        match unwrap_union(value) {
+            Value::Null => self.push_null(),
+            Value::Decimal(val) => {
+                let raw_bytes: Vec<_> = val.try_into().map_err(|err| {
+                    PolarsError::ShapeMismatch(
+                        format!("decimal can't be unwrapped into bytes: {err}").into(),
+                    )
+                })?;
+                let len = raw_bytes.len();
+                let filled: [u8; 16] = raw_bytes
+                    .try_into()
+                    .map_err(|_| PolarsError::ShapeMismatch(format!("polars only supports decimals with up to 16 bytes of precision, but got: {len}").into()))?;
+                let parsed = i128::from_be_bytes(filled);
+                self.push_value(parsed);
+            }
+            _ => {
+                return Err(PolarsError::SchemaMismatch(
+                    format!("expected long, timestamp, or time but got {value:?}").into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -320,6 +363,19 @@ impl<'a> TryExtend<Option<&'a Value>> for Box<dyn ValueBuilder> {
     }
 }
 
+impl<'a> TryExtend<Option<(&'a String, &'a Value)>> for Box<dyn ValueBuilder> {
+    fn try_extend<I: IntoIterator<Item = Option<(&'a String, &'a Value)>>>(
+        &mut self,
+        iter: I,
+    ) -> PolarsResult<()> {
+        for item in iter {
+            let (key, val) = item.unwrap();
+            self.try_push_keyed_value(key, val)?;
+        }
+        Ok(())
+    }
+}
+
 impl MutableArray for ListBuilder {
     fn dtype(&self) -> &ArrowDataType {
         self.inner.dtype()
@@ -366,6 +422,7 @@ impl ValueBuilder for ListBuilder {
                 Ok(())
             }
             Value::Array(vals) => self.inner.try_push(Some(vals.iter().map(Some))),
+            Value::Map(vals) => self.inner.try_push(Some(vals.iter().map(Some))),
             _ => Err(PolarsError::SchemaMismatch(
                 format!("expected array but got {value:?}").into(),
             )),
@@ -483,6 +540,27 @@ impl ValueBuilder for StructBuilder {
         }
         Ok(())
     }
+
+    fn try_push_keyed_value(&mut self, key: &String, value: &Value) -> PolarsResult<()> {
+        if let Some(val) = &mut self.validity {
+            val.push(true);
+        }
+        let mut iter = self.values.iter_mut();
+
+        // push key
+        let key_array = iter.next().unwrap();
+        let keys: &mut MutableBinaryViewArray<str> = key_array.as_mut_any().downcast_mut().unwrap();
+        keys.push_value(key);
+
+        // push val
+        let val_array = iter.next().unwrap();
+        val_array.try_push_value(value)?;
+
+        debug_assert!(iter.next().is_none());
+
+        self.len += 1;
+        Ok(())
+    }
 }
 
 pub fn new_value_builder(dtype: &ArrowDataType, capacity: usize) -> Box<dyn ValueBuilder> {
@@ -494,6 +572,9 @@ pub fn new_value_builder(dtype: &ArrowDataType, capacity: usize) -> Box<dyn Valu
         }
         ArrowDataType::Int64 | ArrowDataType::Timestamp(_, _) | ArrowDataType::Time64(_) => {
             Box::new(MutablePrimitiveArray::<i64>::with_capacity(capacity))
+        }
+        ArrowDataType::Decimal(_, _) => {
+            Box::new(MutablePrimitiveArray::<i128>::with_capacity(capacity))
         }
         ArrowDataType::Float32 => Box::new(MutablePrimitiveArray::<f32>::with_capacity(capacity)),
         ArrowDataType::Float64 => Box::new(MutablePrimitiveArray::<f64>::with_capacity(capacity)),
@@ -527,7 +608,6 @@ pub fn new_value_builder(dtype: &ArrowDataType, capacity: usize) -> Box<dyn Valu
         | ArrowDataType::Duration(_)
         | ArrowDataType::Interval(_)
         | ArrowDataType::Map(_, _)
-        | ArrowDataType::Decimal(_, _)
         | ArrowDataType::Decimal256(_, _)
         | ArrowDataType::Extension(_)
         | ArrowDataType::Unknown
@@ -546,6 +626,7 @@ mod tests {
 
     use super::{ListBuilder, StructBuilder, ValueBuilder};
 
+    /// Test that Box of mutable array is a value builder
     #[test]
     fn test_box_dyn_value_builder() {
         let mut builder: Box<dyn ValueBuilder> = Box::new(MutableBooleanArray::with_capacity(4));
@@ -566,10 +647,14 @@ mod tests {
         builder.push_null();
         assert_eq!(builder.len(), 1);
 
+        builder.push_null();
+        assert_eq!(builder.len(), 2);
+
         builder.reserve(3);
         builder.shrink_to_fit();
     }
 
+    /// Test that list builder works
     #[test]
     fn test_list_builder() {
         let field = ArrowField::new("elem".into(), ArrowDataType::Boolean, true);
@@ -595,6 +680,7 @@ mod tests {
         builder.shrink_to_fit();
     }
 
+    /// Test that struct builder works
     #[test]
     fn test_struct_builder() {
         let field = ArrowField::new("elem".into(), ArrowDataType::Boolean, true);

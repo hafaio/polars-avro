@@ -4,11 +4,12 @@ from collections.abc import Callable
 from io import BytesIO
 
 import polars as pl
+import polars_fastavro
 import pytest
 from polars import DataFrame
 from pytest_benchmark.fixture import BenchmarkFixture
 
-from polars_avro import read_avro, write_avro
+import polars_avro
 
 from .utils import frames_equal
 
@@ -24,7 +25,8 @@ from .utils import frames_equal
     "read_func",
     [
         pytest.param(pl.read_avro, id="polars"),
-        pytest.param(read_avro, id="polars_avro"),
+        pytest.param(polars_fastavro.read_avro, id="polars_fastavro"),
+        pytest.param(polars_avro.read_avro, id="polars_avro"),
     ],
 )
 def test_read(
@@ -35,7 +37,7 @@ def test_read(
         {"ints": [*range(num)], "strings": [str(x) for x in range(num)]}
     )
     buff = BytesIO()
-    write_avro(frame, buff)
+    polars_avro.write_avro(frame, buff)
 
     def func() -> None:
         buff.seek(0)
@@ -55,7 +57,8 @@ def test_read(
     "write_func",
     [
         pytest.param(DataFrame.write_avro, id="polars"),
-        pytest.param(write_avro, id="polars_avro"),
+        pytest.param(polars_fastavro.write_avro, id="polars_fastavro"),
+        pytest.param(polars_avro.write_avro, id="polars_avro"),
     ],
 )
 def test_write(
@@ -80,7 +83,7 @@ def test_write(
         pytest.param(
             DataFrame.write_avro, pl.read_avro, id="polars", marks=pytest.mark.xfail
         ),
-        pytest.param(write_avro, read_avro, id="polars_avro"),
+        pytest.param(polars_avro.write_avro, polars_avro.read_avro, id="polars_avro"),
     ],
 )
 def test_noncontiguous_chunks(
@@ -108,7 +111,7 @@ def test_noncontiguous_chunks(
         pytest.param(
             DataFrame.write_avro, pl.read_avro, id="polars", marks=pytest.mark.xfail
         ),
-        pytest.param(write_avro, read_avro, id="polars_avro"),
+        pytest.param(polars_avro.write_avro, polars_avro.read_avro, id="polars_avro"),
     ],
 )
 def test_noncontiguous_arrays(

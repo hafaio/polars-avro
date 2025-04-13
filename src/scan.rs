@@ -162,10 +162,10 @@ impl AvroIter {
             .into_iter()
             .zip(&mut arrow_columns)
             .map(|(idx, col)| {
-                // we create col from dtype
                 let (name, dtype) = self.schema.get_at_index(idx).unwrap();
                 // NOTE safety is checked inside from, only during debug, the
-                // types won't align due to how enums are built from chunks
+                // types won't align due to how enums are built from chunks, we
+                // need to do it this way, so logical types are interpreted
                 unsafe {
                     Series::from_chunks_and_dtype_unchecked(name.clone(), vec![col.as_box()], dtype)
                 }
@@ -199,23 +199,21 @@ impl Iterator for AvroIter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::path::PathBuf;
 
-    use apache_avro::schema::{
-        FixedSchema, RecordField, RecordFieldOrder, RecordSchema, UnionSchema,
-    };
     use apache_avro::types::Value;
     use apache_avro::{Schema, Writer};
+    use chrono::NaiveTime;
+    use polars::df;
+    use polars::error::PolarsError;
     use polars::frame::DataFrame;
-    use polars::prelude::{IntoLazy, UnionArgs, concat};
+    use polars::prelude::{self as pl, DataType, IntoLazy, Schema as PlSchema, UnionArgs};
     use polars_plan::plans::ScanSources;
     use polars_utils::mmap::MemSlice;
 
-    use crate::Error;
-
     use super::AvroScanner;
+    use crate::Error;
 
     fn from_paths(paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> ScanSources {
         ScanSources::Paths(
@@ -232,12 +230,13 @@ mod tests {
             .into_iter(1024, None)
             .map(|part| part.unwrap().lazy())
             .collect();
-        concat(frames, UnionArgs::default())
+        pl::concat(frames, UnionArgs::default())
             .unwrap()
             .collect()
             .unwrap()
     }
 
+    /// Test scan on a simple file
     #[test]
     fn test_scan() {
         let scanner =
@@ -248,6 +247,7 @@ mod tests {
         assert_eq!(frame.schema().len(), 4);
     }
 
+    /// Test support for globbing
     #[test]
     fn test_glob() {
         let scanner =
@@ -257,6 +257,121 @@ mod tests {
         assert_eq!(frame.schema().len(), 4);
     }
 
+    /// Test reading uuid
+    #[test]
+    fn test_uuid() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": {"type": "string", "name": "uuid", "logicalType": "uuid"}}]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer
+            .append(Value::Record(vec![(
+                "field".into(),
+                Value::String("3738b99e-f4ae-40de-bb3f-fd4aa9d9e9f7".into()),
+            )]))
+            .unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+        )
+        .unwrap();
+        read_scan(scanner);
+    }
+
+    /// Test reading fixed
+    #[test]
+    fn test_fixed() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": {"type": "fixed", "name": "fixed", "size": 4}}]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer
+            .append(Value::Record(vec![(
+                "field".into(),
+                Value::Fixed(4, b"0123".into()),
+            )]))
+            .unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+        )
+        .unwrap();
+        let result = read_scan(scanner);
+        let expected = df! {
+            "field" => [&b"0123"[..]]
+        }
+        .unwrap();
+        assert_eq!(result, expected);
+    }
+
+    /// Test time
+    #[test]
+    fn test_time() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [
+                {"name": "millis", "type": {"type": "int", "logicalType": "time-millis"}},
+                {"name": "micros", "type": {"type": "long", "logicalType": "time-micros"}}
+            ]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer
+            .append(Value::Record(vec![
+                ("millis".into(), Value::TimeMillis(1)),
+                ("micros".into(), Value::TimeMicros(1)),
+            ]))
+            .unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+        )
+        .unwrap();
+        let frame = read_scan(scanner);
+        let expected = df! {
+            "millis" => [
+                NaiveTime::from_hms_milli_opt(0, 0, 0, 1).unwrap(),
+            ],
+            "micros" => [
+                NaiveTime::from_hms_micro_opt(0, 0, 0, 1).unwrap(),
+            ],
+        }
+        .unwrap();
+        assert_eq!(frame, expected);
+    }
+
+    /// Test failure on avros that aren't a top level record
     #[test]
     fn test_non_record_avro() {
         let mut buff = Cursor::new(Vec::new());
@@ -265,128 +380,157 @@ mod tests {
         writer.flush().unwrap();
         let bytes = buff.into_inner();
         let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into_boxed_slice().into()),
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
         );
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
     }
 
+    /// Test failure on avro union type
     #[test]
-    fn test_union_avro() {
+    fn test_map() {
         let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::Record(RecordSchema {
-            name: "base".into(),
-            aliases: None,
-            doc: None,
-            fields: vec![RecordField {
-                name: "a".into(),
-                doc: None,
-                aliases: None,
-                default: None,
-                schema: Schema::Union(
-                    UnionSchema::new(vec![Schema::Boolean, Schema::Int]).unwrap(),
-                ),
-                order: RecordFieldOrder::Ignore,
-                position: 0,
-                custom_attributes: BTreeMap::new(),
-            }],
-            lookup: [("a".into(), 0)].into(),
-            attributes: BTreeMap::new(),
-        });
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": {"type": "map", "values": "int"}}]
+        }
+        "#,
+        )
+        .unwrap();
         let mut writer = Writer::new(&schema, &mut buff);
         writer
             .append(Value::Record(vec![(
-                "a".into(),
+                "field".into(),
+                Value::Map([("key".into(), Value::Int(1))].into()),
+            )]))
+            .unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+        )
+        .unwrap();
+        let frame = read_scan(scanner);
+        let base = df! {
+            "key" => ["key"],
+            "value" => [1],
+        }
+        .unwrap();
+        let expected = base
+            .lazy()
+            .select([
+                pl::concat_list([pl::as_struct(vec![pl::col("key"), pl::col("value")])]).unwrap(),
+            ])
+            .collect()
+            .unwrap();
+        assert_eq!(frame, expected);
+    }
+
+    /// Test failure on avro union type
+    #[test]
+    fn test_union_avro() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": ["boolean", "int"]}]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer
+            .append(Value::Record(vec![(
+                "field".into(),
                 Value::Union(0, Box::new(Value::Boolean(true))),
             )]))
             .unwrap();
         writer.flush().unwrap();
         let bytes = buff.into_inner();
+
         let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into_boxed_slice().into()),
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
         );
         assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
     }
 
+    /// Test failure on union with only null member
     #[test]
     fn test_null_union_avro() {
         let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::Record(RecordSchema {
-            name: "base".into(),
-            aliases: None,
-            doc: None,
-            fields: vec![RecordField {
-                name: "a".into(),
-                doc: None,
-                aliases: None,
-                default: None,
-                schema: Schema::Union(UnionSchema::new(vec![Schema::Null]).unwrap()),
-                order: RecordFieldOrder::Ignore,
-                position: 0,
-                custom_attributes: BTreeMap::new(),
-            }],
-            lookup: [("a".into(), 0)].into(),
-            attributes: BTreeMap::new(),
-        });
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": ["null"]}]
+        }
+        "#,
+        )
+        .unwrap();
         let mut writer = Writer::new(&schema, &mut buff);
         writer
             .append(Value::Record(vec![(
-                "a".into(),
+                "field".into(),
                 Value::Union(0, Box::new(Value::Null)),
             )]))
             .unwrap();
         writer.flush().unwrap();
         let bytes = buff.into_inner();
         let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into_boxed_slice().into()),
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
         )
         .unwrap();
-        read_scan(scanner);
+        let frame = read_scan(scanner);
+        assert_eq!(
+            **frame.schema(),
+            PlSchema::from_iter([("field".into(), DataType::Null)])
+        );
     }
 
+    /// Test failure on with_columns when column isn't present
     #[test]
-    fn test_fixed_avro() {
+    fn test_missing_columns() {
         let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::Record(RecordSchema {
-            name: "base".into(),
-            aliases: None,
-            doc: None,
-            fields: vec![RecordField {
-                name: "a".into(),
-                doc: None,
-                aliases: None,
-                default: None,
-                schema: Schema::Fixed(FixedSchema {
-                    name: "fixed".into(),
-                    aliases: None,
-                    doc: None,
-                    size: 1,
-                    default: None,
-                    attributes: BTreeMap::new(),
-                }),
-                order: RecordFieldOrder::Ignore,
-                position: 0,
-                custom_attributes: BTreeMap::new(),
-            }],
-            lookup: [("a".into(), 0)].into(),
-            attributes: BTreeMap::new(),
-        });
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [{"name": "field", "type": "int"}]
+        }
+        "#,
+        )
+        .unwrap();
         let mut writer = Writer::new(&schema, &mut buff);
         writer
-            .append(Value::Record(vec![("a".into(), Value::Fixed(1, vec![0]))]))
+            .append(Value::Record(vec![("field".into(), Value::Int(0))]))
             .unwrap();
         writer.flush().unwrap();
         let bytes = buff.into_inner();
-        let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into_boxed_slice().into()),
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
-        );
-        assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
+        )
+        .unwrap();
+        let iter = scanner.try_into_iter(1024, Some(&["missing"]));
+        assert!(matches!(
+            iter,
+            Err(Error::Polars(PolarsError::ColumnNotFound(_)))
+        ));
     }
 }
