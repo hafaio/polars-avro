@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::iter::Fuse;
 use std::sync::Arc;
 
-use apache_avro::Codec as AvroCodec;
+use apache_avro::{Bzip2Settings, Codec as AvroCodec, XzSettings, ZstandardSettings};
 use polars::prelude::{PlSmallStr, Schema};
 use polars_io::cloud::CloudOptions;
 use polars_io::cloud::credential_provider::PlCredentialProvider;
@@ -202,21 +202,33 @@ enum Codec {
     Zstandard,
 }
 
-impl From<Codec> for AvroCodec {
-    fn from(codec: Codec) -> Self {
-        match codec {
-            Codec::Null => AvroCodec::Null,
-            Codec::Deflate => AvroCodec::Deflate,
-            Codec::Snappy => AvroCodec::Snappy,
-            Codec::Bzip2 => AvroCodec::Bzip2,
-            Codec::Xz => AvroCodec::Xz,
-            Codec::Zstandard => AvroCodec::Zstandard,
+fn create_codec(codec: Codec, compression_level: Option<u8>) -> AvroCodec {
+    match codec {
+        Codec::Null => AvroCodec::Null,
+        Codec::Deflate => AvroCodec::Deflate,
+        Codec::Snappy => AvroCodec::Snappy,
+        Codec::Bzip2 => AvroCodec::Bzip2(if let Some(compression_level) = compression_level {
+            Bzip2Settings { compression_level }
+        } else {
+            Bzip2Settings::default()
+        }),
+        Codec::Xz => AvroCodec::Xz(if let Some(compression_level) = compression_level {
+            XzSettings { compression_level }
+        } else {
+            XzSettings::default()
+        }),
+        Codec::Zstandard => {
+            AvroCodec::Zstandard(if let Some(compression_level) = compression_level {
+                ZstandardSettings { compression_level }
+            } else {
+                ZstandardSettings::default()
+            })
         }
     }
 }
 
 #[pyfunction]
-#[pyo3(signature = (frames, dest, codec, promote_ints, promote_array, truncate_time, cloud_options, credential_provider, retries))]
+#[pyo3(signature = (frames, dest, codec, promote_ints, promote_array, truncate_time, compression_level, cloud_options, credential_provider, retries))]
 #[allow(clippy::too_many_arguments)]
 fn write_avro(
     py: Python,
@@ -226,6 +238,7 @@ fn write_avro(
     promote_ints: bool,
     promote_array: bool,
     truncate_time: bool,
+    compression_level: Option<u8>,
     cloud_options: Option<Vec<(String, String)>>,
     credential_provider: Option<PyObject>,
     retries: usize,
@@ -250,7 +263,7 @@ fn write_avro(
         frames.into_iter().map(|PyDataFrame(frame)| frame),
         dest,
         WriteOptions {
-            codec: codec.into(),
+            codec: create_codec(codec, compression_level),
             promote_ints,
             promote_array,
             truncate_time,
