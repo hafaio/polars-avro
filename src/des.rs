@@ -10,7 +10,8 @@ use apache_avro::schema::{
 use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
 use polars::prelude::{
-    ArrowDataType, ArrowField, DataType, Field, Schema as PlSchema, TimeUnit, create_enum_dtype,
+    ArrowDataType, ArrowField, DataType, Field, PlSmallStr, Schema as PlSchema, TimeUnit,
+    create_enum_dtype,
 };
 use polars_arrow::array::{
     Array, MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableListArray,
@@ -18,10 +19,15 @@ use polars_arrow::array::{
 };
 use polars_arrow::bitmap::MutableBitmap;
 
+/// Name of mapping key when converted to entries
 const KEY_FIELD: &str = "key";
+/// Name of mapping value when convered to entries
 const VALUE_FIELD: &str = "value";
 
-pub fn try_from_schema(schema: &AvroSchema) -> Result<PlSchema, Error> {
+pub fn try_from_schema(
+    schema: &AvroSchema,
+    single_column_name: Option<&PlSmallStr>,
+) -> Result<PlSchema, Error> {
     if let AvroSchema::Record(rec) = schema {
         Ok(rec
             .fields
@@ -33,6 +39,9 @@ pub fn try_from_schema(schema: &AvroSchema) -> Result<PlSchema, Error> {
                 ))
             })
             .collect::<Result<_, Error>>()?)
+    } else if let Some(col_name) = single_column_name {
+        let field = try_from_dtype(schema)?;
+        Ok(PlSchema::from_iter([(col_name.clone(), field)]))
     } else {
         Err(Error::NonRecordSchema(Box::new(schema.clone())))
     }

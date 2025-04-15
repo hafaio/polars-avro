@@ -202,6 +202,21 @@ def test_read_map_type() -> None:
     assert frames_equal(res, expected)
 
 
+def test_single_col() -> None:
+    """Test that we can read a map type."""
+    buff = BytesIO()
+    fastavro.writer(buff, "int", [1, 2, 10])  # type: ignore
+
+    buff.seek(0)
+    with pytest.raises(Exception, match="top level avro schema must be a record"):
+        read_avro(buff)
+
+    buff.seek(0)
+    res = read_avro(buff, single_col_name="col")
+    expected = pl.from_dict({"col": [1, 2, 10]})
+    assert frames_equal(res, expected)
+
+
 def test_read_options() -> None:
     """Test read works with options."""
     frame = read_avro(

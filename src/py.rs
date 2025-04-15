@@ -5,7 +5,7 @@ use std::iter::Fuse;
 use std::sync::Arc;
 
 use apache_avro::Codec as AvroCodec;
-use polars::prelude::Schema;
+use polars::prelude::{PlSmallStr, Schema};
 use polars_io::cloud::CloudOptions;
 use polars_io::cloud::credential_provider::PlCredentialProvider;
 use polars_plan::prelude::ScanSources;
@@ -101,6 +101,7 @@ pub struct AvroSource {
     sources: ScanSources,
     glob: bool,
     cloud_params: CloudParams,
+    single_col_name: Option<PlSmallStr>,
     schema: Option<Arc<Schema>>,
     last_scanner: Option<AvroScanner>,
 }
@@ -115,6 +116,7 @@ impl AvroSource {
                 &self.sources,
                 self.glob,
                 self.cloud_params.as_options(&self.sources)?,
+                self.single_col_name.clone(),
             )?;
             // ensure we store the schema
             if self.schema.is_none() {
@@ -128,10 +130,11 @@ impl AvroSource {
 #[pymethods]
 impl AvroSource {
     #[new]
-    #[pyo3(signature = (sources, glob, cloud_options, credential_provider, retries, file_cache_ttl))]
+    #[pyo3(signature = (sources, glob, single_col_name, cloud_options, credential_provider, retries, file_cache_ttl))]
     fn new(
         sources: Wrap<ScanSources>,
         glob: bool,
+        single_col_name: Option<String>,
         cloud_options: Option<Vec<(String, String)>>,
         credential_provider: Option<PyObject>,
         retries: usize,
@@ -147,6 +150,7 @@ impl AvroSource {
                 retries,
                 file_cache_ttl,
             },
+            single_col_name: single_col_name.map(PlSmallStr::from),
             schema: None,
             last_scanner: None,
         }
@@ -163,6 +167,7 @@ impl AvroSource {
                         &self.sources,
                         self.glob,
                         self.cloud_params.as_options(&self.sources)?,
+                        self.single_col_name.clone(),
                     )?;
                     let schema = new_scanner.schema();
                     self.last_scanner = Some(new_scanner);

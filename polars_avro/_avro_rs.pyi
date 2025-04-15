@@ -28,6 +28,7 @@ class AvroSource:
         self,
         sources: list[str] | list[BinaryIO],
         glob: bool,
+        single_col_name: str | None,
         cloud_options: list[tuple[str, str]] | None,
         credential_provider: CredentialProviderBuilder | None,
         retries: int,

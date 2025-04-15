@@ -12,7 +12,7 @@ use apache_avro::Reader;
 use apache_avro::types::Value;
 use polars::error::PolarsError;
 use polars::frame::DataFrame;
-use polars::prelude::{Column, CompatLevel, Schema as PlSchema};
+use polars::prelude::{Column, CompatLevel, PlSmallStr, Schema as PlSchema};
 use polars::series::Series;
 use polars_io::cloud::CloudOptions;
 use polars_plan::prelude::ScanSources;
@@ -23,6 +23,7 @@ pub struct AvroScanner {
     reader: Reader<'static, Cursor<MemSlice>>,
     source_iter: SourceIter,
     schema: Arc<PlSchema>,
+    single_column_name: Option<PlSmallStr>,
 }
 
 impl AvroScanner {
@@ -35,16 +36,21 @@ impl AvroScanner {
         sources: &ScanSources,
         glob: bool,
         cloud_options: Option<&CloudOptions>,
+        single_column_name: Option<PlSmallStr>,
     ) -> Result<Self, Error> {
         let mut source_iter = SourceIter::try_from(sources, cloud_options, glob)?;
         let source = source_iter.next().ok_or(Error::EmptySources)??;
         let reader = Reader::new(source)?;
-        let schema = Arc::new(des::try_from_schema(reader.writer_schema())?);
+        let schema = Arc::new(des::try_from_schema(
+            reader.writer_schema(),
+            single_column_name.as_ref(),
+        )?);
 
         Ok(Self {
             reader,
             source_iter,
             schema,
+            single_column_name,
         })
     }
 
@@ -63,6 +69,7 @@ impl AvroScanner {
             reader: self.reader,
             source_iter: self.source_iter,
             schema: self.schema,
+            single_column_name: self.single_column_name,
             batch_size,
             with_columns,
         }
@@ -98,6 +105,7 @@ impl AvroScanner {
             reader: self.reader,
             source_iter: self.source_iter,
             schema: self.schema,
+            single_column_name: self.single_column_name,
             batch_size,
             with_columns,
         }
@@ -110,6 +118,7 @@ pub struct AvroIter {
     reader: Reader<'static, Cursor<MemSlice>>,
     source_iter: SourceIter,
     schema: Arc<PlSchema>,
+    single_column_name: Option<PlSmallStr>,
     batch_size: usize,
     with_columns: Option<Arc<[usize]>>,
 }
@@ -140,7 +149,9 @@ impl AvroIter {
                         col.try_push_value(val).map_err(Error::Polars)?;
                     }
                 } else {
-                    unreachable!("top level schema validated as a record schema");
+                    // mapped to a single column
+                    let col = arrow_columns.first_mut().unwrap();
+                    col.try_push_value(&val).map_err(Error::Polars)?;
                 }
             } else if let Some(source) = self.source_iter.next() {
                 self.reader = Reader::new(source?)?;
@@ -149,7 +160,10 @@ impl AvroIter {
                 // scanning multiple avro files as long as they have the
                 // same converted arrow schema, e.g. nullability or
                 // different integers.
-                let new_schema = des::try_from_schema(self.reader.writer_schema())?;
+                let new_schema = des::try_from_schema(
+                    self.reader.writer_schema(),
+                    self.single_column_name.as_ref(),
+                )?;
                 if new_schema != *self.schema {
                     return Err(Error::NonMatchingSchemas);
                 }
@@ -239,9 +253,13 @@ mod tests {
     /// Test scan on a simple file
     #[test]
     fn test_scan() {
-        let scanner =
-            AvroScanner::new_from_sources(&from_paths(["./resources/food.avro"]), false, None)
-                .unwrap();
+        let scanner = AvroScanner::new_from_sources(
+            &from_paths(["./resources/food.avro"]),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         let frame = read_scan(scanner);
         assert_eq!(frame.height(), 27);
         assert_eq!(frame.schema().len(), 4);
@@ -251,7 +269,8 @@ mod tests {
     #[test]
     fn test_glob() {
         let scanner =
-            AvroScanner::new_from_sources(&from_paths(["./resources/*.avro"]), true, None).unwrap();
+            AvroScanner::new_from_sources(&from_paths(["./resources/*.avro"]), true, None, None)
+                .unwrap();
         let frame = read_scan(scanner);
         assert_eq!(frame.height(), 30);
         assert_eq!(frame.schema().len(), 4);
@@ -284,6 +303,7 @@ mod tests {
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
+            None,
         )
         .unwrap();
         read_scan(scanner);
@@ -315,6 +335,7 @@ mod tests {
         let scanner = AvroScanner::new_from_sources(
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
+            None,
             None,
         )
         .unwrap();
@@ -356,6 +377,7 @@ mod tests {
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
+            None,
         )
         .unwrap();
         let frame = read_scan(scanner);
@@ -382,6 +404,7 @@ mod tests {
         let res = AvroScanner::new_from_sources(
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
+            None,
             None,
         );
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
@@ -414,6 +437,7 @@ mod tests {
         let scanner = AvroScanner::new_from_sources(
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
+            None,
             None,
         )
         .unwrap();
@@ -461,6 +485,7 @@ mod tests {
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
+            None,
         );
         assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
     }
@@ -491,6 +516,7 @@ mod tests {
         let scanner = AvroScanner::new_from_sources(
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
+            None,
             None,
         )
         .unwrap();
@@ -525,6 +551,7 @@ mod tests {
             &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
             false,
             None,
+            None,
         )
         .unwrap();
         let iter = scanner.try_into_iter(1024, Some(&["missing"]));
@@ -532,5 +559,51 @@ mod tests {
             iter,
             Err(Error::Polars(PolarsError::ColumnNotFound(_)))
         ));
+    }
+
+    /// Test non-record avro fails
+    #[test]
+    fn test_non_record() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(r#""int""#).unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer.append(Value::Int(0)).unwrap();
+        writer.append(Value::Int(1)).unwrap();
+        writer.append(Value::Int(4)).unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let res = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+            None,
+        );
+        assert!(matches!(res, Err(Error::NonRecordSchema(_))));
+    }
+
+    /// Test non-record avro fails
+    #[test]
+    fn test_single_column_name() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(r#""int""#).unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer.append(Value::Int(0)).unwrap();
+        writer.append(Value::Int(1)).unwrap();
+        writer.append(Value::Int(4)).unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+            Some("col".into()),
+        )
+        .unwrap();
+        let frame = read_scan(scanner);
+        let expected = df! {
+            "col" => [0, 1, 4]
+        }
+        .unwrap();
+        assert_eq!(frame, expected);
     }
 }

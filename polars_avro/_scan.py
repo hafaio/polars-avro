@@ -18,6 +18,7 @@ def scan_avro(  # noqa: PLR0913
     *,
     batch_size: int = 32768,
     glob: bool = True,
+    single_col_name: str | None = None,
     storage_options: Mapping[str, str] | None = None,
     credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
     retries: int = 2,
@@ -65,11 +66,15 @@ def scan_avro(  # noqa: PLR0913
     src = AvroSource(
         normed,
         glob,
+        single_col_name,
         cloud_options,
         credential_provider_builder,
         retries,
         file_cache_ttl,
     )
+
+    def get_schema() -> pl.Schema:
+        return pl.Schema(src.schema())
 
     def source_generator(
         with_columns: list[str] | None,
@@ -90,7 +95,7 @@ def scan_avro(  # noqa: PLR0913
                 if n_rows == 0:
                     break
 
-    return register_io_source(source_generator, schema=lambda: pl.Schema(src.schema()))
+    return register_io_source(source_generator, schema=get_schema)
 
 
 def read_avro(  # noqa: PLR0913
@@ -103,6 +108,7 @@ def read_avro(  # noqa: PLR0913
     rechunk: bool = False,
     batch_size: int = 32768,
     glob: bool = True,
+    single_col_name: str | None = None,
     storage_options: Mapping[str, str] | None = None,
     credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
     retries: int = 2,
@@ -130,6 +136,7 @@ def read_avro(  # noqa: PLR0913
         sources,
         batch_size=batch_size,
         glob=glob,
+        single_col_name=single_col_name,
         storage_options=storage_options,
         credential_provider=credential_provider,
         retries=retries,
