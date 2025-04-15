@@ -15,11 +15,7 @@ pub fn try_as_schema(
     promote_array: bool,
     truncate_time: bool,
 ) -> Result<AvroSchema, Error> {
-    let ser = Serializer {
-        promote_ints,
-        promote_array,
-        truncate_time,
-    };
+    let mut ser = Serializer::new(promote_ints, promote_array, truncate_time);
     let fields = schema
         .iter()
         .enumerate()
@@ -58,40 +54,63 @@ struct Serializer {
     promote_ints: bool,
     promote_array: bool,
     truncate_time: bool,
-}
-
-fn create_enum_schema(rev_mapping: &RevMapping) -> Result<EnumSchema, Error> {
-    Ok(EnumSchema {
-        name: "polars_avro_enum".into(),
-        aliases: None,
-        doc: None,
-        symbols: rev_mapping
-            .get_categories()
-            .iter()
-            .map(|val| val.map(str::to_string).ok_or(Error::NullEnum))
-            .collect::<Result<_, _>>()?,
-        default: None,
-        attributes: BTreeMap::new(),
-    })
-}
-
-fn create_decimal_schema(precision: usize, scale: usize) -> DecimalSchema {
-    DecimalSchema {
-        precision,
-        scale,
-        inner: Box::new(AvroSchema::Fixed(FixedSchema {
-            name: "polars_avro_decimal".into(),
-            aliases: None,
-            doc: None,
-            size: 16, // polars uses i128s so this is the max size
-            default: None,
-            attributes: BTreeMap::new(),
-        })),
-    }
+    counter: usize,
 }
 
 impl Serializer {
-    fn create_record_schema(&self, fields: &[Field]) -> Result<RecordSchema, Error> {
+    fn new(promote_ints: bool, promote_array: bool, truncate_time: bool) -> Self {
+        Self {
+            promote_ints,
+            promote_array,
+            truncate_time,
+            counter: 0,
+        }
+    }
+
+    fn inc(&mut self) -> usize {
+        let res = self.counter;
+        self.counter += 1;
+        res
+    }
+
+    // FIXME test double enum and double decimal
+    fn create_enum_schema(&mut self, rev_mapping: &RevMapping) -> Result<EnumSchema, Error> {
+        Ok(EnumSchema {
+            name: Name {
+                name: format!("polars_avro_enum_{}", self.inc()),
+                namespace: None,
+            },
+            aliases: None,
+            doc: None,
+            symbols: rev_mapping
+                .get_categories()
+                .iter()
+                .map(|val| val.map(str::to_string).ok_or(Error::NullEnum))
+                .collect::<Result<_, _>>()?,
+            default: None,
+            attributes: BTreeMap::new(),
+        })
+    }
+
+    fn create_decimal_schema(&mut self, precision: usize, scale: usize) -> DecimalSchema {
+        DecimalSchema {
+            precision,
+            scale,
+            inner: Box::new(AvroSchema::Fixed(FixedSchema {
+                name: Name {
+                    name: format!("polars_avro_decimal_{}", self.inc()),
+                    namespace: None,
+                },
+                aliases: None,
+                doc: None,
+                size: 16, // polars uses i128s so this is the max size
+                default: None,
+                attributes: BTreeMap::new(),
+            })),
+        }
+    }
+
+    fn create_record_schema(&mut self, fields: &[Field]) -> Result<RecordSchema, Error> {
         let fields = fields
             .iter()
             .enumerate()
@@ -115,7 +134,7 @@ impl Serializer {
             .collect();
         Ok(RecordSchema {
             name: Name {
-                name: "polars_avro_record".into(),
+                name: format!("polars_avro_record_{}", self.inc()),
                 namespace: None,
             },
             aliases: None,
@@ -126,7 +145,7 @@ impl Serializer {
         })
     }
 
-    fn try_as_schema(&self, dtype: &DataType) -> Result<AvroSchema, Error> {
+    fn try_as_schema(&mut self, dtype: &DataType) -> Result<AvroSchema, Error> {
         let base = match dtype {
             DataType::Null => return Ok(AvroSchema::Null),
             DataType::Boolean => AvroSchema::Boolean,
@@ -141,7 +160,7 @@ impl Serializer {
             DataType::Float32 => AvroSchema::Float,
             DataType::Float64 => AvroSchema::Double,
             &DataType::Decimal(Some(precision), Some(scale)) => {
-                AvroSchema::Decimal(create_decimal_schema(precision, scale))
+                AvroSchema::Decimal(self.create_decimal_schema(precision, scale))
             }
             DataType::String => AvroSchema::String,
             DataType::Binary => AvroSchema::Bytes,
@@ -165,7 +184,7 @@ impl Serializer {
             DataType::List(elem_type) => AvroSchema::array(self.try_as_schema(elem_type)?),
             DataType::Categorical(rev_mapping, _) | DataType::Enum(rev_mapping, _) => {
                 if let Some(rev_mapping) = rev_mapping {
-                    AvroSchema::Enum(create_enum_schema(rev_mapping)?)
+                    AvroSchema::Enum(self.create_enum_schema(rev_mapping)?)
                 } else {
                     return Err(Error::NullEnum);
                 }
