@@ -55,6 +55,7 @@ fn bench_read_polars_avro(b: &mut Bencher) {
                 &ScanSources::Buffers(vec![MemSlice::from_vec(buff.clone())].into()),
                 false,
                 None,
+                None,
             )
             .unwrap()
             .into_iter(1024, None)
