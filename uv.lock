@@ -828,7 +828,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "maturin", specifier = ">=1.8.2" },
-    { name = "polars", specifier = ">=1.20.0" },
+    { name = "polars", specifier = ">=1.3.0" },
     { name = "pyarrow", specifier = ">=19.0.1" },
 ]
 
@@ -838,7 +838,7 @@ dev = [
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "myst-parser", specifier = ">=4.0.1" },
     { name = "nbformat", specifier = ">=5.10.4" },
-    { name = "polars-fastavro", specifier = ">=0.1.0" },
+    { name = "polars-fastavro", specifier = ">=0.4.0" },
     { name = "pyright", specifier = ">=1.1.398" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest-benchmark", specifier = ">=5.1.0" },
@@ -849,15 +849,15 @@ dev = [
 
 [[package]]
 name = "polars-fastavro"
-version = "0.2.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastavro" },
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/92/0f0abea545d18f3c98546f5ba6ef27444447879cdf8f02c27da43111f013/polars_fastavro-0.2.0.tar.gz", hash = "sha256:876f20ecec875bd226b3f68451fd3c52ac8dfe8fe9dfe8a9efd255f48852cd46", size = 57711 }
+sdist = { url = "https://files.pythonhosted.org/packages/32/91/3bc7a47525830b4f2b47e978907a5753244c95f13173337d4dd966a3346d/polars_fastavro-0.4.0.tar.gz", hash = "sha256:f2514249b3bb655cb97a14b217995d47cc173b9f9358ff648466dea6a7b75215", size = 58280 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/43/0e5f1e9c5fd0dc86f17fe9ec82e79c465477eba9b506172d8ad19ed11c06/polars_fastavro-0.2.0-py3-none-any.whl", hash = "sha256:d7963946d4a3850c903893babd647c4863337a09af95733d28046f885d12b480", size = 7808 },
+    { url = "https://files.pythonhosted.org/packages/de/f5/23088870ef23d1ac2b524b43e269a9eebc7546376b139278ca6728ebdf11/polars_fastavro-0.4.0-py3-none-any.whl", hash = "sha256:93266aa7d2db2eb0aa8d913ec5abda23fcafc3c2d742ecffba8970ac57b9831a", size = 8200 },
 ]
 
 [[package]]
