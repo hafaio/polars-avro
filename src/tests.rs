@@ -5,7 +5,7 @@ use chrono::{NaiveDate, NaiveTime};
 use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
-    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs,
+    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs, create_enum_dtype,
 };
 use polars_arrow::array::{MutableArray, Utf8ViewArray};
 use polars_plan::plans::ScanSources;
@@ -19,7 +19,7 @@ fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
 
 fn deserialize(buff: Vec<u8>) -> DataFrame {
     let sources = ScanSources::Buffers(vec![MemSlice::from_vec(buff)].into());
-    let scanner = AvroScanner::new_from_sources(&sources, false, None).unwrap();
+    let scanner = AvroScanner::new_from_sources(&sources, false, None, None).unwrap();
     let schema = scanner.schema();
     let iter = scanner.into_iter(2, None);
     let parts: Vec<_> = iter.map(|part| part.unwrap().lazy()).collect();
@@ -79,6 +79,36 @@ fn test_transitivity() {
     ));
 
     assert_eq!(frame, reconstruction);
+}
+
+#[test]
+fn test_col_transitivity() {
+    for frame in [df! {
+        "col" => [Some("a"), Some("b"), None],
+    }
+    .unwrap()
+    .lazy()
+    .select([
+        pl::col("col").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+            "a", "b",
+        ]))),
+    ])
+    .collect()
+    .unwrap()]
+    {
+        // write / read
+        let reconstruction = deserialize(serialize(
+            frame.clone(),
+            WriteOptions {
+                codec: Codec::Null,
+                promote_ints: false,
+                promote_array: false,
+                truncate_time: false,
+            },
+        ));
+
+        assert_eq!(frame, reconstruction);
+    }
 }
 
 #[test]
@@ -159,7 +189,7 @@ fn test_different_schemas() {
     );
 
     let sources = ScanSources::Buffers(vec![one.into(), two.into()].into());
-    let scanner = AvroScanner::new_from_sources(&sources, false, None).unwrap();
+    let scanner = AvroScanner::new_from_sources(&sources, false, None, None).unwrap();
     let iter = scanner.into_iter(2, None);
     let parts: Result<Vec<_>, _> = iter.map(|part| part).collect();
     assert!(matches!(parts, Err(Error::NonMatchingSchemas)));
