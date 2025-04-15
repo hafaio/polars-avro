@@ -133,6 +133,35 @@ from .utils import frames_equal
             ),
             id="nested",
         ),
+        pytest.param(
+            pl.from_dict(
+                {
+                    "struct": [[1, "a"], [None, "b"], [3, None]],
+                    "single": [[1.0], [2.0], [3.0]],
+                },
+                schema={
+                    "struct": pl.Struct({"a": pl.Int32, "b": pl.String}),
+                    "single": pl.Struct({"x": pl.Float64}),
+                },
+            ),
+            id="double struct",
+        ),
+        pytest.param(
+            pl.from_dict(
+                {
+                    "one": ["a", "b", None],
+                    "two": ["c", None, "d"],
+                },
+                schema={
+                    "one": pl.Enum(["a", "b", "c"]),
+                    "two": pl.Enum(["c", "d"]),
+                },
+            ),
+            id="double enum",
+            marks=pytest.mark.xfail(
+                reason="https://github.com/pola-rs/polars/issues/22273"
+            ),
+        ),
     ],
 )
 def test_transitive(frame: pl.DataFrame):

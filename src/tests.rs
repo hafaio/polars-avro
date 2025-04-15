@@ -33,10 +33,30 @@ fn deserialize(buff: Vec<u8>) -> DataFrame {
     }
 }
 
-#[test]
-fn test_transitivity() {
-    // create data
-    let frame: DataFrame = df!(
+macro_rules! test_transitivity {
+    ($name:ident: $frame:expr) => {
+        #[test]
+        fn $name() {
+            // create data
+            let frame: DataFrame = $frame;
+
+            // write / read
+            let reconstruction = deserialize(serialize(
+                frame.clone(),
+                WriteOptions {
+                    codec: Codec::Null,
+                    promote_ints: false,
+                    promote_array: false,
+                    truncate_time: false,
+                },
+            ));
+
+            assert_eq!(frame, reconstruction);
+        }
+    };
+}
+
+test_transitivity!(test_transitivity_complex: df!(
         "name" => [Some("Alice Archer"), Some("Ben Brown"), Some("Chloe Cooper"), None],
         "weight" => [None, Some(72.5), Some(53.6), None],
         "height" => [Some(1.56_f32), None, Some(1.65_f32), Some(1.75_f32)],
@@ -65,25 +85,10 @@ fn test_transitivity() {
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, None)).alias("birthtime_nano_local"),
         pl::col("rating").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values(["mid", "slay"]))),
         pl::col("height").strict_cast(DataType::Decimal(Some(15), Some(2))).alias("decimal"),
-    ]).collect().unwrap();
+    ]).collect().unwrap()
+);
 
-    // write / read
-    let reconstruction = deserialize(serialize(
-        frame.clone(),
-        WriteOptions {
-            codec: Codec::Null,
-            promote_ints: false,
-            promote_array: false,
-            truncate_time: false,
-        },
-    ));
-
-    assert_eq!(frame, reconstruction);
-}
-
-#[test]
-fn test_col_transitivity() {
-    for frame in [df! {
+test_transitivity!(test_transitivity_enum: df! {
         "col" => [Some("a"), Some("b"), None],
     }
     .unwrap()
@@ -94,22 +99,54 @@ fn test_col_transitivity() {
         ]))),
     ])
     .collect()
-    .unwrap()]
-    {
-        // write / read
-        let reconstruction = deserialize(serialize(
-            frame.clone(),
-            WriteOptions {
-                codec: Codec::Null,
-                promote_ints: false,
-                promote_array: false,
-                truncate_time: false,
-            },
-        ));
+    .unwrap()
+);
 
-        assert_eq!(frame, reconstruction);
+test_transitivity!(test_transitivity_double_enum: df! {
+        "one" => [Some("a"), Some("b"), None],
+        "two" => [Some("c"), Some("d"), None],
     }
-}
+    .unwrap()
+    .lazy()
+    .select([
+        pl::col("one").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+            "a", "b",
+        ]))),
+        pl::col("two").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+            "d", "c",
+        ]))),
+    ])
+    .collect()
+    .unwrap()
+);
+
+test_transitivity!(test_transitivity_double_decimal: df! {
+        "one" => [Some("1.0"), Some("2.0"), None],
+        "two" => [Some("234242342.1231"), Some("2342.12"), None],
+    }
+    .unwrap()
+    .lazy()
+    .select([
+        pl::col("one").strict_cast(DataType::Decimal(Some(2), Some(1))),
+        pl::col("two").strict_cast(DataType::Decimal(Some(16), Some(6))),
+    ])
+    .collect()
+    .unwrap()
+);
+
+test_transitivity!(test_transitivity_double_struct: df! {
+        "one" => [Some(1.0), Some(2.0), None],
+        "two" => [Some("234242342.1231"), None, Some("2342.12")],
+    }
+    .unwrap()
+    .lazy()
+    .select([
+        pl::as_struct(vec![pl::col("one"), pl::col("two")]).alias("first"),
+        pl::as_struct(vec![pl::col("two"), pl::col("one")]).alias("second"),
+    ])
+    .collect()
+    .unwrap()
+);
 
 #[test]
 fn test_promotion_truncation() {
