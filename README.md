@@ -46,6 +46,7 @@ let scanner = AvroScanner::new_from_sources(
     &ScanSources::Paths(...),
     false, // expand globs
     None,  // cloud options
+    None,  // name for single column avros
 ).unwrap()
 
 sink_avro(
@@ -76,6 +77,14 @@ serde works.
    while a fixed type can be read into a u8 array, it must be serialized back as
    a list of i32s. This may be addressed with polars support for arrow
    fixedlengthbinary, but that seems unlikely.
+
+## Benchmarks
+
+| Library           |         Read Python |        Write Python |            Read Rust |            Write Rust |
+| ----------------- | ------------------: | ------------------: | -------------------: | --------------------: |
+| `polars`          |    6.0319 ms (1.00) |    3.0663 ms (1.00) |  41,653.91 ns (1.00) |   39,970.80 ns (1.00) |
+| `polars-avro`     |   39.9563 ms (6.62) |  67.9542 ms (22.16) | 340,622.90 ns (8.18) | 513,200.00 ns (12.84) |
+| `polars-fastavro` | 179.0461 ms (29.68) | 246.3771 ms (80.35) |                    - |                     - |
 
 ## Development
 
@@ -109,7 +118,7 @@ uv run pyright
 uv run pytest
 ```
 
-### Benchmarks
+### Benchmarking
 
 ```sh
 cargo +nightly bench

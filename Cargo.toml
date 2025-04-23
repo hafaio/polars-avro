@@ -34,7 +34,7 @@ polars = { version = "0.46.0", default-features = false, features = [
     "lazy",
     "timezones",
 ] }
-apache-avro = "0.17.0"
+apache-avro = "0.18.0"
 polars-arrow = "0.46.0"
 polars-io = { version = "0.46.0", features = ["file_cache"] }
 polars-plan = { version = "0.46.0", features = ["cloud"] }

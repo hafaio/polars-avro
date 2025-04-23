@@ -46,6 +46,7 @@ def write_avro(
     promote_ints: bool,
     promote_array: bool,
     truncate_time: bool,
+    compression_level: int | None,
     cloud_options: list[tuple[str, str]] | None,
     credential_provider: CredentialProviderBuilder | None,
     retries: int,

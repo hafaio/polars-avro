@@ -97,7 +97,7 @@ def scan_avro(  # noqa: PLR0913
 
     try:
         return register_io_source(source_generator, schema=get_schema)
-    except TypeError:
+    except TypeError:  # pragma: no cover
         eager_schema = get_schema()
         return register_io_source(source_generator, schema=eager_schema)
 
