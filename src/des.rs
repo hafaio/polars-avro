@@ -10,12 +10,13 @@ use apache_avro::schema::{
 use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
 use polars::prelude::{
-    ArrowDataType, ArrowField, DataType, Field, PlSmallStr, Schema as PlSchema, TimeUnit,
+    ArrowDataType, CompatLevel, DataType, Field, PlSmallStr, Schema as PlSchema, TimeUnit,
     create_enum_dtype,
 };
 use polars_arrow::array::{
-    Array, MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableListArray,
-    MutableNullArray, MutablePrimitiveArray, StructArray, TryExtend, TryPush, Utf8ViewArray,
+    Array, MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableDictionaryArray,
+    MutableListArray, MutableNullArray, MutablePrimitiveArray, StructArray, TryExtend, TryPush,
+    Utf8ViewArray,
 };
 use polars_arrow::bitmap::MutableBitmap;
 
@@ -298,11 +299,11 @@ impl ValueBuilder for MutablePrimitiveArray<i128> {
     }
 }
 
-impl ValueBuilder for MutablePrimitiveArray<u32> {
+impl ValueBuilder for MutableDictionaryArray<u32, MutableBinaryViewArray<str>> {
     fn try_push_value(&mut self, value: &Value) -> PolarsResult<()> {
         match unwrap_union(value) {
             Value::Null => self.push_null(),
-            &Value::Enum(val, _) => self.push_value(val),
+            Value::Enum(_, val) => self.try_push(Some(val.as_ref()))?,
             _ => {
                 return Err(PolarsError::SchemaMismatch(
                     format!("expected enum but got {value:?}").into(),
@@ -349,11 +350,13 @@ pub struct ListBuilder {
 }
 
 impl ListBuilder {
-    pub fn with_capacity(field: &ArrowField, capacity: usize) -> Self {
+    pub fn with_capacity(dtype: &DataType, capacity: usize) -> Self {
         Self {
             inner: MutableListArray::new_from(
-                new_value_builder(&field.dtype, capacity),
-                ArrowDataType::LargeList(Box::new(field.clone())),
+                new_value_builder(dtype, capacity),
+                ArrowDataType::LargeList(Box::new(
+                    dtype.to_arrow_field("item".into(), CompatLevel::newest()),
+                )),
                 capacity,
             ),
         }
@@ -448,13 +451,22 @@ pub struct StructBuilder {
 }
 
 impl StructBuilder {
-    pub fn with_capacity(fields: &[ArrowField], capacity: usize) -> Self {
+    pub fn with_capacity(fields: &[Field], capacity: usize) -> Self {
         let values = fields
             .iter()
             .map(|field| new_value_builder(&field.dtype, capacity))
             .collect();
         Self {
-            dtype: ArrowDataType::Struct(Vec::from(fields)),
+            dtype: ArrowDataType::Struct(
+                fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .dtype
+                            .to_arrow_field(field.name.clone(), CompatLevel::newest())
+                    })
+                    .collect(),
+            ),
             len: 0,
             values,
             validity: None,
@@ -572,65 +584,67 @@ impl ValueBuilder for StructBuilder {
     }
 }
 
-pub fn new_value_builder(dtype: &ArrowDataType, capacity: usize) -> Box<dyn ValueBuilder> {
+pub fn new_value_builder(dtype: &DataType, capacity: usize) -> Box<dyn ValueBuilder> {
     match dtype {
-        ArrowDataType::Boolean => Box::new(MutableBooleanArray::with_capacity(capacity)),
-        ArrowDataType::Null => Box::new(MutableNullArray::new(ArrowDataType::Null, 0)),
-        ArrowDataType::Int32 | ArrowDataType::Date32 => {
-            Box::new(MutablePrimitiveArray::<i32>::with_capacity(capacity))
+        DataType::Boolean => Box::new(MutableBooleanArray::with_capacity(capacity)),
+        DataType::Null => Box::new(MutableNullArray::new(ArrowDataType::Null, 0)),
+        DataType::Int32 => Box::new(MutablePrimitiveArray::<i32>::with_capacity(capacity)),
+        DataType::Date => Box::new(
+            MutablePrimitiveArray::<i32>::try_new(
+                ArrowDataType::Date32,
+                Vec::with_capacity(capacity),
+                None,
+            )
+            .unwrap(),
+        ),
+        DataType::Int64 => Box::new(MutablePrimitiveArray::<i64>::with_capacity(capacity)),
+        DataType::Datetime(_, _) | DataType::Time => Box::new(
+            MutablePrimitiveArray::<i64>::try_new(
+                dtype.to_arrow(CompatLevel::newest()),
+                Vec::with_capacity(capacity),
+                None,
+            )
+            .unwrap(),
+        ),
+        &DataType::Decimal(Some(precision), Some(scale)) => Box::new(
+            MutablePrimitiveArray::<i128>::try_new(
+                ArrowDataType::Decimal(precision, scale),
+                Vec::with_capacity(capacity),
+                None,
+            )
+            .unwrap(),
+        ),
+        DataType::Float32 => Box::new(MutablePrimitiveArray::<f32>::with_capacity(capacity)),
+        DataType::Float64 => Box::new(MutablePrimitiveArray::<f64>::with_capacity(capacity)),
+        DataType::String => Box::new(MutableBinaryViewArray::<str>::with_capacity(capacity)),
+        DataType::Binary => Box::new(MutableBinaryViewArray::<[u8]>::with_capacity(capacity)),
+        DataType::Enum(revmap, _) | DataType::Categorical(revmap, _) => {
+            let num = revmap.as_ref().map_or_else(|| 0, |rv| rv.len());
+            let mut vals = MutableBinaryViewArray::<str>::with_capacity(num);
+            // NOTE ideally we should be able to copy back into mutability efficiently
+            if let Some(revmap) = revmap {
+                vals.extend(revmap.get_categories().iter());
+            }
+            // NOTE fails if there are more than u32 values, or they're non-unique, but these are guaranteed by avro spec
+            let mut array =
+                MutableDictionaryArray::<u32, MutableBinaryViewArray<str>>::from_values(vals)
+                    .unwrap();
+            array.reserve(capacity);
+            Box::new(array)
         }
-        ArrowDataType::Int64 | ArrowDataType::Timestamp(_, _) | ArrowDataType::Time64(_) => {
-            Box::new(MutablePrimitiveArray::<i64>::with_capacity(capacity))
-        }
-        ArrowDataType::Decimal(_, _) => {
-            Box::new(MutablePrimitiveArray::<i128>::with_capacity(capacity))
-        }
-        ArrowDataType::Float32 => Box::new(MutablePrimitiveArray::<f32>::with_capacity(capacity)),
-        ArrowDataType::Float64 => Box::new(MutablePrimitiveArray::<f64>::with_capacity(capacity)),
-        ArrowDataType::Utf8View => Box::new(MutableBinaryViewArray::<str>::with_capacity(capacity)),
-        ArrowDataType::BinaryView => {
-            Box::new(MutableBinaryViewArray::<[u8]>::with_capacity(capacity))
-        }
-        // NOTE technically a dictionary array, but due to the series interface, we actually want to push raw u32
-        ArrowDataType::Dictionary(_, _, _) => {
-            Box::new(MutablePrimitiveArray::<u32>::with_capacity(capacity))
-        }
-        ArrowDataType::LargeList(field) => Box::new(ListBuilder::with_capacity(field, capacity)),
-        ArrowDataType::Struct(fields) => Box::new(StructBuilder::with_capacity(fields, capacity)),
-        ArrowDataType::Int8
-        | ArrowDataType::Int16
-        | ArrowDataType::Int128
-        | ArrowDataType::UInt8
-        | ArrowDataType::UInt16
-        | ArrowDataType::UInt32
-        | ArrowDataType::UInt64
-        | ArrowDataType::Float16
-        | ArrowDataType::Date64
-        | ArrowDataType::Time32(_)
-        | ArrowDataType::Utf8
-        | ArrowDataType::LargeUtf8
-        | ArrowDataType::Binary
-        | ArrowDataType::LargeBinary
-        | ArrowDataType::FixedSizeBinary(_)
-        | ArrowDataType::FixedSizeList(_, _)
-        | ArrowDataType::List(_)
-        | ArrowDataType::Duration(_)
-        | ArrowDataType::Interval(_)
-        | ArrowDataType::Map(_, _)
-        | ArrowDataType::Decimal256(_, _)
-        | ArrowDataType::Extension(_)
-        | ArrowDataType::Unknown
-        | ArrowDataType::Union(_) => unreachable!("{dtype:?}"),
+        DataType::List(dtype) => Box::new(ListBuilder::with_capacity(dtype, capacity)),
+        DataType::Struct(fields) => Box::new(StructBuilder::with_capacity(fields, capacity)),
+        _ => unreachable!(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use apache_avro::types::Value;
-    use polars::prelude::{ArrowDataType, ArrowField};
+    use polars::prelude::{ArrowDataType, ArrowField, DataType, Field};
     use polars_arrow::array::{
-        MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableNullArray,
-        MutablePrimitiveArray,
+        MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableDictionaryArray,
+        MutableNullArray, MutablePrimitiveArray,
     };
 
     use super::{ListBuilder, StructBuilder, ValueBuilder};
@@ -666,8 +680,8 @@ mod tests {
     /// Test that list builder works
     #[test]
     fn test_list_builder() {
-        let field = ArrowField::new("elem".into(), ArrowDataType::Boolean, true);
-        let mut builder = ListBuilder::with_capacity(&field, 3);
+        let mut builder = ListBuilder::with_capacity(&DataType::Boolean, 3);
+        let field = ArrowField::new("item".into(), ArrowDataType::Boolean, true);
 
         assert_eq!(
             builder.dtype(),
@@ -693,7 +707,8 @@ mod tests {
     #[test]
     fn test_struct_builder() {
         let field = ArrowField::new("elem".into(), ArrowDataType::Boolean, true);
-        let mut builder = StructBuilder::with_capacity(&[field.clone()], 3);
+        let mut builder =
+            StructBuilder::with_capacity(&[Field::new("elem".into(), DataType::Boolean)], 3);
 
         assert_eq!(builder.dtype(), &ArrowDataType::Struct(vec![field.clone()]));
         assert_eq!(builder.len(), 0);
@@ -735,7 +750,7 @@ mod tests {
         let mut builder = MutablePrimitiveArray::<f64>::new();
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
-        let mut builder = MutablePrimitiveArray::<u32>::new();
+        let mut builder = MutableDictionaryArray::<u32, MutableBinaryViewArray<str>>::new();
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
         let mut builder = MutableBinaryViewArray::<[u8]>::new();
@@ -744,16 +759,11 @@ mod tests {
         let mut builder = MutableBinaryViewArray::<str>::new();
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
-        let mut builder = ListBuilder::with_capacity(
-            &ArrowField::new("elem".into(), ArrowDataType::Boolean, true),
-            0,
-        );
+        let mut builder = ListBuilder::with_capacity(&DataType::Boolean, 0);
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
-        let mut builder = StructBuilder::with_capacity(
-            &[ArrowField::new("elem".into(), ArrowDataType::Boolean, true)],
-            0,
-        );
+        let mut builder =
+            StructBuilder::with_capacity(&[Field::new("elem".into(), DataType::Boolean)], 0);
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
     }
 }

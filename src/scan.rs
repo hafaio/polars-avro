@@ -12,7 +12,7 @@ use apache_avro::Reader;
 use apache_avro::types::Value;
 use polars::error::PolarsError;
 use polars::frame::DataFrame;
-use polars::prelude::{Column, CompatLevel, PlSmallStr, Schema as PlSchema};
+use polars::prelude::{Column, PlSmallStr, Schema as PlSchema};
 use polars::series::Series;
 use polars_io::cloud::CloudOptions;
 use polars_plan::prelude::ScanSources;
@@ -128,7 +128,6 @@ impl AvroIter {
         &mut self,
         with_columns: impl IntoIterator<Item = usize> + Clone,
     ) -> Result<Vec<Column>, Error> {
-        let compat = CompatLevel::newest();
         // abstracts this where we also pass in inds, which is a cloneable usize iterator and can eeither be with_columns or 0..width()
         let mut arrow_columns: Box<[_]> = with_columns
             .clone()
@@ -136,7 +135,7 @@ impl AvroIter {
             .map(|idx| {
                 // already checked that idx valid for schema
                 let (_, dtype) = self.schema.get_at_index(idx).unwrap();
-                new_value_builder(&dtype.to_arrow(compat), self.batch_size)
+                new_value_builder(dtype, self.batch_size)
             })
             .collect();
 
@@ -172,20 +171,16 @@ impl AvroIter {
             }
         }
 
-        Ok(with_columns
+        with_columns
             .into_iter()
             .zip(&mut arrow_columns)
             .map(|(idx, col)| {
                 let (name, dtype) = self.schema.get_at_index(idx).unwrap();
-                // NOTE safety is checked inside from, only during debug, the
-                // types won't align due to how enums are built from chunks, we
-                // need to do it this way, so logical types are interpreted
-                unsafe {
-                    Series::from_chunks_and_dtype_unchecked(name.clone(), vec![col.as_box()], dtype)
-                }
-                .into()
+                let ser = Series::from_arrow(name.clone(), col.as_box())?;
+                // NOTE we intentionally want to avoid any actual casting here
+                Ok(unsafe { ser.cast_unchecked(dtype) }?.into())
             })
-            .collect())
+            .collect()
     }
 
     fn read_frame(&mut self) -> Result<DataFrame, Error> {

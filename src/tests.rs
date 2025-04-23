@@ -5,7 +5,7 @@ use chrono::{NaiveDate, NaiveTime};
 use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
-    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs, create_enum_dtype,
+    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs,
 };
 use polars_arrow::array::{MutableArray, Utf8ViewArray};
 use polars_plan::plans::ScanSources;
@@ -94,7 +94,7 @@ test_transitivity!(test_transitivity_enum: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("col").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+        pl::col("col").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
             "a", "b",
         ]))),
     ])
@@ -109,10 +109,10 @@ test_transitivity!(test_transitivity_double_enum: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("one").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+        pl::col("one").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
             "a", "b",
         ]))),
-        pl::col("two").strict_cast(create_enum_dtype(Utf8ViewArray::from_slice_values([
+        pl::col("two").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
             "d", "c",
         ]))),
     ])
@@ -127,7 +127,7 @@ test_transitivity!(test_transitivity_double_decimal: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("one").strict_cast(DataType::Decimal(Some(2), Some(1))),
+        pl::col("one").strict_cast(DataType::Decimal(Some(3), Some(1))),
         pl::col("two").strict_cast(DataType::Decimal(Some(16), Some(6))),
     ])
     .collect()
@@ -143,6 +143,23 @@ test_transitivity!(test_transitivity_double_struct: df! {
     .select([
         pl::as_struct(vec![pl::col("one"), pl::col("two")]).alias("first"),
         pl::as_struct(vec![pl::col("two"), pl::col("one")]).alias("second"),
+    ])
+    .collect()
+    .unwrap()
+);
+
+test_transitivity!(test_transitivity_enum_struct: df! {
+        "one" => ["a", "a", "b"],
+        "two" => [1, 4, 3],
+    }
+    .unwrap()
+    .lazy()
+    .select([
+        pl::as_struct(vec![pl::col("one").strict_cast(pl::create_enum_dtype(
+            Utf8ViewArray::from_slice_values([
+                "a", "b",
+            ])
+        )), pl::col("two")]).alias("col"),
     ])
     .collect()
     .unwrap()
