@@ -73,7 +73,6 @@ impl Serializer {
         res
     }
 
-    // FIXME test double enum and double decimal
     fn create_enum_schema(&mut self, rev_mapping: &RevMapping) -> Result<EnumSchema, Error> {
         Ok(EnumSchema {
             name: Name {
