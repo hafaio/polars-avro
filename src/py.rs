@@ -288,6 +288,9 @@ impl From<Error> for PyErr {
                 AvroSpecError::new_err(format!("unsupported type in write conversion: {data_type}"))
             }
             Error::NullEnum => AvroSpecError::new_err("enum schema contained null fields"),
+            Error::MissingRefName(name) => {
+                AvroSpecError::new_err(format!("couldn't find referenced {name} in schema"))
+            }
             Error::NonMatchingSchemas => {
                 AvroSpecError::new_err("encountered non-identical schemas in same batch")
             }

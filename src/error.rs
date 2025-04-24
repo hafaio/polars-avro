@@ -9,6 +9,7 @@ use polars::error::PolarsError;
 use polars::prelude::{ArrowDataType, DataType};
 
 /// Any error raised by this crate
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     /// An error from polars
@@ -30,6 +31,8 @@ pub enum Error {
     NullEnum,
     /// If not all schemas in a batch were identical
     NonMatchingSchemas,
+    /// If the avro referenced name couldn't be found
+    MissingRefName(String),
     /// If arrow type doesn't match expected schema type during serialization
     InvalidArrowType(DataType, ArrowDataType),
     /// If an avro value didn't match the expected deserializer
@@ -61,6 +64,9 @@ impl Display for Error {
                 )
             }
             Error::NullEnum => write!(f, "Polars allows unspecified enums, but avro does not"),
+            Error::MissingRefName(name) => {
+                write!(f, "referenced name {name} wasn't found in the schema")
+            }
             Error::NonMatchingSchemas => {
                 write!(f, "All batches must share the same schema")
             }

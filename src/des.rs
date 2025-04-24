@@ -1,11 +1,12 @@
 //! Utilidies for deserializing from from avro.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 
 use super::Error;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{
-    ArraySchema, DecimalSchema, EnumSchema, MapSchema, RecordField, RecordSchema,
+    ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, RecordField, RecordSchema,
 };
 use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
@@ -25,10 +26,43 @@ const KEY_FIELD: &str = "key";
 /// Name of mapping value when convered to entries
 const VALUE_FIELD: &str = "value";
 
+fn resolve_names<'a>(names: &mut BTreeMap<String, &'a AvroSchema>, val: &'a AvroSchema) {
+    match val {
+        AvroSchema::Record(RecordSchema { name, fields, .. }) => {
+            let resolved = name.fullname(None);
+            let residual = names.insert(resolved, val);
+            debug_assert!(residual.is_none(), "found duplicate full names in schema");
+            for field in fields {
+                resolve_names(names, &field.schema);
+            }
+        }
+        AvroSchema::Enum(EnumSchema { name, .. }) | AvroSchema::Fixed(FixedSchema { name, .. }) => {
+            let resolved = name.fullname(None);
+            let residual = names.insert(resolved, val);
+            debug_assert!(residual.is_none(), "found duplicate full names in schema");
+        }
+        AvroSchema::Array(ArraySchema { items, .. }) => {
+            resolve_names(names, items);
+        }
+        AvroSchema::Map(MapSchema { types, .. }) => {
+            resolve_names(names, types);
+        }
+        AvroSchema::Union(union_schema) => {
+            for variant in union_schema.variants() {
+                resolve_names(names, variant);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn try_from_schema(
     schema: &AvroSchema,
     single_column_name: Option<&PlSmallStr>,
 ) -> Result<PlSchema, Error> {
+    let mut names = BTreeMap::new();
+    resolve_names(&mut names, schema);
+
     if let AvroSchema::Record(rec) = schema {
         Ok(rec
             .fields
@@ -36,19 +70,22 @@ pub fn try_from_schema(
             .map(|rf| {
                 Ok(Field::new(
                     rf.name.as_str().into(),
-                    try_from_dtype(&rf.schema)?,
+                    try_from_dtype(&names, &rf.schema)?,
                 ))
             })
             .collect::<Result<_, Error>>()?)
     } else if let Some(col_name) = single_column_name {
-        let field = try_from_dtype(schema)?;
+        let field = try_from_dtype(&names, schema)?;
         Ok(PlSchema::from_iter([(col_name.clone(), field)]))
     } else {
         Err(Error::NonRecordSchema(Box::new(schema.clone())))
     }
 }
 
-fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
+fn try_from_dtype<'a>(
+    names: &BTreeMap<String, &'a AvroSchema>,
+    schema: &'a AvroSchema,
+) -> Result<DataType, Error> {
     Ok(match schema {
         AvroSchema::Null => DataType::Null,
         AvroSchema::Boolean => DataType::Boolean,
@@ -59,7 +96,7 @@ fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
         AvroSchema::Bytes | AvroSchema::Uuid | AvroSchema::Fixed(_) => DataType::Binary,
         AvroSchema::String => DataType::String,
         AvroSchema::Array(ArraySchema { items, .. }) => {
-            DataType::List(Box::new(try_from_dtype(items)?))
+            DataType::List(Box::new(try_from_dtype(names, items)?))
         }
         AvroSchema::Record(RecordSchema { fields, .. }) => DataType::Struct(
             fields
@@ -67,7 +104,7 @@ fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
                 .map(|RecordField { name, schema, .. }| {
                     Ok(Field {
                         name: name.as_str().into(),
-                        dtype: try_from_dtype(schema)?,
+                        dtype: try_from_dtype(names, schema)?,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
@@ -89,20 +126,28 @@ fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
         AvroSchema::LocalTimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, None),
         AvroSchema::Union(union) => match union.variants() {
             [AvroSchema::Null, other] | [other, AvroSchema::Null] | [other] => {
-                try_from_dtype(other)?
+                try_from_dtype(names, other)?
             }
             _ => return Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
         },
         AvroSchema::Map(MapSchema { types, .. }) => {
             DataType::List(Box::new(DataType::Struct(vec![
                 Field::new(KEY_FIELD.into(), DataType::String),
-                Field::new(VALUE_FIELD.into(), try_from_dtype(types)?),
+                Field::new(VALUE_FIELD.into(), try_from_dtype(names, types)?),
             ])))
         }
         &AvroSchema::Decimal(DecimalSchema {
             precision, scale, ..
         }) => DataType::Decimal(Some(precision), Some(scale)),
-        AvroSchema::BigDecimal | AvroSchema::Duration | AvroSchema::Ref { .. } => {
+        AvroSchema::Ref { name } => {
+            let resolved = name.fullname(None);
+            if let Some(referenced) = names.get(&resolved) {
+                try_from_dtype(names, referenced)?
+            } else {
+                return Err(Error::MissingRefName(resolved));
+            }
+        }
+        AvroSchema::BigDecimal | AvroSchema::Duration => {
             return Err(Error::UnsupportedAvroType(Box::new(schema.clone())));
         }
     })
