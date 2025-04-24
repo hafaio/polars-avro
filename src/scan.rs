@@ -601,4 +601,99 @@ mod tests {
         .unwrap();
         assert_eq!(frame, expected);
     }
+
+    /// Test that scanner can appropriately read schemas with references
+    #[test]
+    fn test_refereces() {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::parse_str(
+            r#"
+        {
+            "type": "record",
+            "name": "base",
+            "fields": [
+                {"name": "first", "type": "enum", "symbols": ["a"]},
+                {"name": "second", "type": { "type": "enum", "name": "explicit.second", "symbols": ["b"]}},
+                {"name": "a", "type": { "name": "a", "type": "record", "namespace": "outer", "fields": [
+                    {"name": "first", "type": "enum", "symbols": ["c"]},
+                    {"name": "fourth", "namespace": "explicit", "type": "enum", "symbols": ["d"]},
+                    {"name": "b", "type": {"name": "b", "type": "record", "fields": [
+                        {"name": "fifth", "type": "enum", "symbols": ["e"]},
+                        {"name": "sixth", "namespace": "explicit", "type": "enum", "symbols": ["f"]},
+                        {"name": "c", "type": { "name": "inner.c", "type": "record", "fields": [
+                            {"name": "first", "type": "enum", "symbols": ["g"]},
+                            {"name": "eighth", "namespace": "explicit", "type": "enum", "symbols": ["h"]},
+                            {"name": "ninth", "type": "first"},
+                            {"name": "tenth", "type": "outer.first"},
+                            {"name": "eleventh", "type": "explicit.second"}
+                        ]}},
+                        {"name": "twlevth", "type": "first"},
+                        {"name": "thirteenth", "type": "inner.first"},
+                        {"name": "fourteenth", "type": "explicit.eighth"}
+                    ]}},
+                    {"name": "fifteenth", "type": "first"},
+                    {"name": "sixteenth", "type": "inner.first"},
+                    {"name": "seventeenth", "type": "explicit.sixth"}
+                ]}},
+                {"name": "eighteenth", "type": "first"},
+                {"name": "nineteenth", "type": "inner.first"},
+                {"name": "twentyth", "type": "outer.first"}
+            ]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, &mut buff);
+        writer
+            .append(Value::Record(vec![
+                ("first".into(), Value::Enum(0, "a".into())),
+                ("second".into(), Value::Enum(0, "b".into())),
+                (
+                    "a".into(),
+                    Value::Record(vec![
+                        ("first".into(), Value::Enum(0, "c".into())),
+                        ("fourth".into(), Value::Enum(0, "d".into())),
+                        (
+                            "b".into(),
+                            Value::Record(vec![
+                                ("fifth".into(), Value::Enum(0, "e".into())),
+                                ("sixth".into(), Value::Enum(0, "f".into())),
+                                (
+                                    "c".into(),
+                                    Value::Record(vec![
+                                        ("first".into(), Value::Enum(0, "g".into())),
+                                        ("eighth".into(), Value::Enum(0, "h".into())),
+                                        ("ninth".into(), Value::Enum(0, "g".into())),
+                                        ("tenth".into(), Value::Enum(0, "c".into())),
+                                        ("eleventh".into(), Value::Enum(0, "b".into())),
+                                    ]),
+                                ),
+                                ("twlevth".into(), Value::Enum(0, "c".into())),
+                                ("thirteenth".into(), Value::Enum(0, "g".into())),
+                                ("fourteenth".into(), Value::Enum(0, "h".into())),
+                            ]),
+                        ),
+                        ("fifteenth".into(), Value::Enum(0, "c".into())),
+                        ("sixteenth".into(), Value::Enum(0, "g".into())),
+                        ("seventeenth".into(), Value::Enum(0, "f".into())),
+                    ]),
+                ),
+                ("eighteenth".into(), Value::Enum(0, "a".into())),
+                ("nineteenth".into(), Value::Enum(0, "g".into())),
+                ("twentyth".into(), Value::Enum(0, "c".into())),
+            ]))
+            .unwrap();
+        writer.flush().unwrap();
+        let bytes = buff.into_inner();
+        let scanner = AvroScanner::new_from_sources(
+            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let frame = read_scan(scanner);
+        assert_eq!(frame.height(), 1);
+        assert_eq!(frame.width(), 6);
+    }
 }
