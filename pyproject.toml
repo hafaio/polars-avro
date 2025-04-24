@@ -1,6 +1,6 @@
 [project]
 name = "polars-avro"
-version = "0.5.0"
+version = "0.6.0"
 description = "Polars io-plugin for reading and writing avro files"
 readme = "README.md"
 requires-python = ">=3.10"
