@@ -26,131 +26,117 @@ const KEY_FIELD: &str = "key";
 /// Name of mapping value when convered to entries
 const VALUE_FIELD: &str = "value";
 
-fn resolve_names<'a>(names: &mut BTreeMap<String, &'a AvroSchema>, val: &'a AvroSchema) {
-    match val {
-        AvroSchema::Record(RecordSchema { name, fields, .. }) => {
-            let resolved = name.fullname(None);
-            let residual = names.insert(resolved, val);
-            debug_assert!(residual.is_none(), "found duplicate full names in schema");
-            for field in fields {
-                resolve_names(names, &field.schema);
-            }
-        }
-        AvroSchema::Enum(EnumSchema { name, .. }) | AvroSchema::Fixed(FixedSchema { name, .. }) => {
-            let resolved = name.fullname(None);
-            let residual = names.insert(resolved, val);
-            debug_assert!(residual.is_none(), "found duplicate full names in schema");
-        }
-        AvroSchema::Array(ArraySchema { items, .. }) => {
-            resolve_names(names, items);
-        }
-        AvroSchema::Map(MapSchema { types, .. }) => {
-            resolve_names(names, types);
-        }
-        AvroSchema::Union(union_schema) => {
-            for variant in union_schema.variants() {
-                resolve_names(names, variant);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub fn try_from_schema(
     schema: &AvroSchema,
     single_column_name: Option<&PlSmallStr>,
 ) -> Result<PlSchema, Error> {
-    let mut names = BTreeMap::new();
-    resolve_names(&mut names, schema);
-
-    if let AvroSchema::Record(rec) = schema {
-        Ok(rec
-            .fields
-            .iter()
-            .map(|rf| {
-                Ok(Field::new(
-                    rf.name.as_str().into(),
-                    try_from_dtype(&names, &rf.schema)?,
-                ))
-            })
-            .collect::<Result<_, Error>>()?)
+    let dtype = DataTypeParser::try_from_dtype(schema)?;
+    if let DataType::Struct(fields) = dtype {
+        Ok(PlSchema::from_iter(fields))
     } else if let Some(col_name) = single_column_name {
-        let field = try_from_dtype(&names, schema)?;
-        Ok(PlSchema::from_iter([(col_name.clone(), field)]))
+        Ok(PlSchema::from_iter([(col_name.clone(), dtype)]))
     } else {
         Err(Error::NonRecordSchema(Box::new(schema.clone())))
     }
 }
 
-fn try_from_dtype<'a>(
-    names: &BTreeMap<String, &'a AvroSchema>,
-    schema: &'a AvroSchema,
-) -> Result<DataType, Error> {
-    Ok(match schema {
-        AvroSchema::Null => DataType::Null,
-        AvroSchema::Boolean => DataType::Boolean,
-        AvroSchema::Int => DataType::Int32,
-        AvroSchema::Long => DataType::Int64,
-        AvroSchema::Float => DataType::Float32,
-        AvroSchema::Double => DataType::Float64,
-        AvroSchema::Bytes | AvroSchema::Uuid | AvroSchema::Fixed(_) => DataType::Binary,
-        AvroSchema::String => DataType::String,
-        AvroSchema::Array(ArraySchema { items, .. }) => {
-            DataType::List(Box::new(try_from_dtype(names, items)?))
-        }
-        AvroSchema::Record(RecordSchema { fields, .. }) => DataType::Struct(
-            fields
-                .iter()
-                .map(|RecordField { name, schema, .. }| {
-                    Ok(Field {
-                        name: name.as_str().into(),
-                        dtype: try_from_dtype(names, schema)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?,
-        ),
-        AvroSchema::Enum(EnumSchema { symbols, .. }) => {
-            create_enum_dtype(Utf8ViewArray::from_slice_values(symbols))
-        }
-        AvroSchema::Date => DataType::Date,
-        AvroSchema::TimeMillis | AvroSchema::TimeMicros => DataType::Time,
-        AvroSchema::TimestampMillis => {
-            DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))
-        }
-        AvroSchema::TimestampMicros => {
-            DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))
-        }
-        AvroSchema::TimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into())),
-        AvroSchema::LocalTimestampMillis => DataType::Datetime(TimeUnit::Milliseconds, None),
-        AvroSchema::LocalTimestampMicros => DataType::Datetime(TimeUnit::Microseconds, None),
-        AvroSchema::LocalTimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, None),
-        AvroSchema::Union(union) => match union.variants() {
-            [AvroSchema::Null, other] | [other, AvroSchema::Null] | [other] => {
-                try_from_dtype(names, other)?
+#[derive(Debug, Default)]
+struct DataTypeParser {
+    names: BTreeMap<String, DataType>,
+}
+
+impl DataTypeParser {
+    fn try_from_dtype(schema: &AvroSchema) -> Result<DataType, Error> {
+        let mut parser = DataTypeParser::default();
+        parser.try_from_dtype_inner(schema)
+    }
+
+    fn try_from_dtype_inner(&mut self, schema: &AvroSchema) -> Result<DataType, Error> {
+        Ok(match schema {
+            AvroSchema::Null => DataType::Null,
+            AvroSchema::Boolean => DataType::Boolean,
+            AvroSchema::Int => DataType::Int32,
+            AvroSchema::Long => DataType::Int64,
+            AvroSchema::Float => DataType::Float32,
+            AvroSchema::Double => DataType::Float64,
+            AvroSchema::Bytes | AvroSchema::Uuid => DataType::Binary,
+            AvroSchema::String => DataType::String,
+            AvroSchema::Array(ArraySchema { items, .. }) => {
+                DataType::List(Box::new(self.try_from_dtype_inner(items)?))
             }
-            _ => return Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
-        },
-        AvroSchema::Map(MapSchema { types, .. }) => {
-            DataType::List(Box::new(DataType::Struct(vec![
-                Field::new(KEY_FIELD.into(), DataType::String),
-                Field::new(VALUE_FIELD.into(), try_from_dtype(names, types)?),
-            ])))
-        }
-        &AvroSchema::Decimal(DecimalSchema {
-            precision, scale, ..
-        }) => DataType::Decimal(Some(precision), Some(scale)),
-        AvroSchema::Ref { name } => {
-            let resolved = name.fullname(None);
-            if let Some(referenced) = names.get(&resolved) {
-                try_from_dtype(names, referenced)?
-            } else {
-                return Err(Error::MissingRefName(resolved));
+            AvroSchema::Record(RecordSchema { fields, name, .. }) => {
+                let fullname = name.fullname(None);
+                let dtype = DataType::Struct(
+                    fields
+                        .iter()
+                        .map(|RecordField { name, schema, .. }| {
+                            Ok(Field {
+                                name: name.as_str().into(),
+                                dtype: self.try_from_dtype_inner(schema)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?,
+                );
+                let old = self.names.insert(fullname, dtype.clone());
+                debug_assert!(old.is_none(), "found duplicate name {name:?}");
+                dtype
             }
-        }
-        AvroSchema::BigDecimal | AvroSchema::Duration => {
-            return Err(Error::UnsupportedAvroType(Box::new(schema.clone())));
-        }
-    })
+            AvroSchema::Enum(EnumSchema { symbols, name, .. }) => {
+                let fullname = name.fullname(None);
+                let dtype = create_enum_dtype(Utf8ViewArray::from_slice_values(symbols));
+                let old = self.names.insert(fullname, dtype.clone());
+                debug_assert!(old.is_none(), "found duplicate name {name:?}");
+                dtype
+            }
+            AvroSchema::Fixed(FixedSchema { name, .. }) => {
+                let fullname = name.fullname(None);
+                let dtype = DataType::Binary;
+                let old = self.names.insert(fullname, dtype.clone());
+                debug_assert!(old.is_none(), "found duplicate name {name:?}");
+                dtype
+            }
+            AvroSchema::Date => DataType::Date,
+            AvroSchema::TimeMillis | AvroSchema::TimeMicros => DataType::Time,
+            AvroSchema::TimestampMillis => {
+                DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))
+            }
+            AvroSchema::TimestampMicros => {
+                DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))
+            }
+            AvroSchema::TimestampNanos => {
+                DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into()))
+            }
+            AvroSchema::LocalTimestampMillis => DataType::Datetime(TimeUnit::Milliseconds, None),
+            AvroSchema::LocalTimestampMicros => DataType::Datetime(TimeUnit::Microseconds, None),
+            AvroSchema::LocalTimestampNanos => DataType::Datetime(TimeUnit::Nanoseconds, None),
+            AvroSchema::Union(union) => match union.variants() {
+                [AvroSchema::Null, other] | [other, AvroSchema::Null] | [other] => {
+                    self.try_from_dtype_inner(other)?
+                }
+                _ => return Err(Error::UnsupportedAvroType(Box::new(schema.clone()))),
+            },
+            AvroSchema::Map(MapSchema { types, .. }) => {
+                DataType::List(Box::new(DataType::Struct(vec![
+                    Field::new(KEY_FIELD.into(), DataType::String),
+                    Field::new(VALUE_FIELD.into(), self.try_from_dtype_inner(types)?),
+                ])))
+            }
+            &AvroSchema::Decimal(DecimalSchema {
+                precision, scale, ..
+            }) => DataType::Decimal(Some(precision), Some(scale)),
+            AvroSchema::Ref { name } => {
+                let resolved = name.fullname(None);
+                if let Some(referenced) = self.names.get(&resolved) {
+                    referenced.clone()
+                } else {
+                    return Err(Error::MissingRefName(resolved));
+                }
+            }
+            AvroSchema::BigDecimal | AvroSchema::Duration => {
+                return Err(Error::UnsupportedAvroType(Box::new(schema.clone())));
+            }
+        })
+    }
 }
 
 pub trait ValueBuilder: MutableArray {

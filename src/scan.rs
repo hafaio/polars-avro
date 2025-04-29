@@ -604,7 +604,7 @@ mod tests {
 
     /// Test that scanner can appropriately read schemas with references
     #[test]
-    fn test_refereces() {
+    fn test_references() {
         let mut buff = Cursor::new(Vec::new());
         let schema = Schema::parse_str(
             r#"
