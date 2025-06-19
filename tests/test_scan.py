@@ -1,15 +1,10 @@
 """Test scan functionality."""
 
 from io import BytesIO
-from typing import NoReturn
-from unittest.mock import patch
 
 import fastavro
 import polars as pl
 import pytest
-from polars.io.cloud.credential_provider._builder import (
-    CredentialProviderBuilder,  # type: ignore[reportPrivateImportUsage]
-)
 
 from polars_avro import read_avro, scan_avro, write_avro
 
@@ -244,46 +239,3 @@ class SentinelError(AssertionError):
     """A sentinel error for raising."""
 
     pass
-
-
-def raises(*_: object, **__: object) -> NoReturn:
-    """Raise a sentinel error."""
-    raise SentinelError("sentinel")
-
-
-def test_credential_provider_scan() -> None:
-    """Test that credential provider is passed to scan."""
-    with patch.object(CredentialProviderBuilder, "__init__", raises):
-        with pytest.raises(SentinelError):
-            scan_avro("s3://bucket/path", credential_provider="auto")
-
-        with pytest.raises(AssertionError):
-            scan_avro(
-                "s3://bucket/path",
-                credential_provider="auto",
-                storage_options={"aws_region": "eu-west-1"},
-            )
-
-    with patch.object(CredentialProviderBuilder, "__init__", raises):
-        # Passing `None` should disable the automatic instantiation of
-        # `CredentialProviderAWS`
-        scan_avro(
-            "s3://bucket/path",
-            credential_provider=None,
-        )
-        # Passing `storage_options` should disable the automatic instantiation of
-        # `CredentialProviderAWS`
-        scan_avro(
-            "s3://bucket/path",
-            credential_provider="auto",
-            storage_options={
-                "aws_secret_access_key_id": "polars",
-            },
-        )
-
-    with pytest.raises(Exception, match="is not callable"):
-        scan_avro(
-            "s3://bucket/path",
-            credential_provider=raises,
-            storage_options={"aws_region": "eu-west-1"},
-        ).collect()

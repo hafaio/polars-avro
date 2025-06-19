@@ -1,12 +1,11 @@
 //! Rust scan implementation
 
-use std::io::Cursor;
-use std::iter::Fuse;
+use std::io::Read;
+use std::iter::{Fuse, FusedIterator};
 use std::sync::Arc;
 
 use crate::des::new_value_builder;
 
-use super::io::SourceIter;
 use super::{Error, des};
 use apache_avro::Reader;
 use apache_avro::types::Value;
@@ -14,32 +13,72 @@ use polars::error::PolarsError;
 use polars::frame::DataFrame;
 use polars::prelude::{Column, PlSmallStr, Schema as PlSchema};
 use polars::series::Series;
-use polars_io::cloud::CloudOptions;
-use polars_plan::prelude::ScanSources;
-use polars_utils::mmap::MemSlice;
 
 /// An abstract scanner that can be converted into an iterator over `DataFrame`s
-pub struct AvroScanner {
-    reader: Reader<'static, Cursor<MemSlice>>,
-    source_iter: SourceIter,
+pub struct AvroScanner<R, I> {
+    reader: Reader<'static, R>,
+    sources: I,
     schema: Arc<PlSchema>,
     single_column_name: Option<PlSmallStr>,
 }
 
-impl AvroScanner {
+// FIXME move into module since we need to expose it
+pub enum Infallable {}
+
+impl From<Infallable> for Error {
+    fn from(_: Infallable) -> Self {
+        unreachable!()
+    }
+}
+
+pub struct InfallableIter<I>(I);
+
+impl<I: Iterator> Iterator for InfallableIter<I> {
+    type Item = Result<I::Item, Infallable>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(Result::Ok)
+    }
+}
+
+impl<I: ExactSizeIterator> ExactSizeIterator for InfallableIter<I> {}
+impl<I: FusedIterator> FusedIterator for InfallableIter<I> {}
+
+impl<R, I> AvroScanner<R, InfallableIter<I>>
+where
+    R: Read,
+    I: Iterator<Item = R>,
+{
     /// Create a new scanner from `ScanSources`
     ///
     /// # Errors
     ///
-    /// If the schema can't be converted into a polars schema, or any other io errors.
-    pub fn new_from_sources(
-        sources: &ScanSources,
-        glob: bool,
-        cloud_options: Option<&CloudOptions>,
+    /// If the schema can't be converted into a polars schema.
+    pub fn new(
+        sources: impl IntoIterator<IntoIter = I>,
         single_column_name: Option<PlSmallStr>,
     ) -> Result<Self, Error> {
-        let mut source_iter = SourceIter::try_from(sources, cloud_options, glob)?;
-        let source = source_iter.next().ok_or(Error::EmptySources)??;
+        Self::try_new(InfallableIter(sources.into_iter()), single_column_name)
+    }
+}
+
+impl<R, E, I> AvroScanner<R, I>
+where
+    R: Read,
+    Error: From<E>,
+    I: Iterator<Item = Result<R, E>>,
+{
+    /// Create a new scanner from `ScanSources`
+    ///
+    /// # Errors
+    ///
+    /// If the schema can't be converted into a polars schema, or any errors from the readers.
+    pub fn try_new(
+        sources: impl IntoIterator<IntoIter = I>,
+        single_column_name: Option<PlSmallStr>,
+    ) -> Result<Self, Error> {
+        let mut sources = sources.into_iter();
+        let source = sources.next().ok_or(Error::EmptySources)??;
         let reader = Reader::new(source)?;
         let schema = Arc::new(des::try_from_schema(
             reader.writer_schema(),
@@ -48,7 +87,7 @@ impl AvroScanner {
 
         Ok(Self {
             reader,
-            source_iter,
+            sources,
             schema,
             single_column_name,
         })
@@ -64,10 +103,10 @@ impl AvroScanner {
         self,
         batch_size: usize,
         with_columns: Option<Arc<[usize]>>,
-    ) -> Fuse<AvroIter> {
+    ) -> Fuse<AvroIter<R, I>> {
         AvroIter {
             reader: self.reader,
-            source_iter: self.source_iter,
+            sources: self.sources,
             schema: self.schema,
             single_column_name: self.single_column_name,
             batch_size,
@@ -87,7 +126,7 @@ impl AvroScanner {
         self,
         batch_size: usize,
         columns: Option<&[impl AsRef<str>]>,
-    ) -> Result<Fuse<AvroIter>, Error> {
+    ) -> Result<Fuse<AvroIter<R, I>>, Error> {
         let with_columns = if let Some(columns) = columns {
             let indexes = columns
                 .iter()
@@ -103,7 +142,7 @@ impl AvroScanner {
         };
         Ok(AvroIter {
             reader: self.reader,
-            source_iter: self.source_iter,
+            sources: self.sources,
             schema: self.schema,
             single_column_name: self.single_column_name,
             batch_size,
@@ -114,16 +153,21 @@ impl AvroScanner {
 }
 
 /// An `Iterator` of `DataFrame` batches scanned from various sources
-pub struct AvroIter {
-    reader: Reader<'static, Cursor<MemSlice>>,
-    source_iter: SourceIter,
+pub struct AvroIter<R, I> {
+    reader: Reader<'static, R>,
+    sources: I,
     schema: Arc<PlSchema>,
     single_column_name: Option<PlSmallStr>,
     batch_size: usize,
     with_columns: Option<Arc<[usize]>>,
 }
 
-impl AvroIter {
+impl<R, E, I> AvroIter<R, I>
+where
+    R: Read,
+    Error: From<E>,
+    I: Iterator<Item = Result<R, E>>,
+{
     fn read_columns(
         &mut self,
         with_columns: impl IntoIterator<Item = usize> + Clone,
@@ -152,7 +196,7 @@ impl AvroIter {
                     let col = arrow_columns.first_mut().unwrap();
                     col.try_push_value(&val).map_err(Error::Polars)?;
                 }
-            } else if let Some(source) = self.source_iter.next() {
+            } else if let Some(source) = self.sources.next() {
                 self.reader = Reader::new(source?)?;
                 // NOTE we could be lazy and just check compatability, but
                 // we do want something like this equality, which will allow
@@ -195,7 +239,12 @@ impl AvroIter {
     }
 }
 
-impl Iterator for AvroIter {
+impl<R, E, I> Iterator for AvroIter<R, I>
+where
+    R: Read,
+    Error: From<E>,
+    I: Iterator<Item = Result<R, E>>,
+{
     type Item = Result<DataFrame, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -208,8 +257,9 @@ impl Iterator for AvroIter {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::path::PathBuf;
+    use std::fs::File;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::sync::Arc;
 
     use apache_avro::types::Value;
     use apache_avro::{Schema, Writer};
@@ -218,23 +268,16 @@ mod tests {
     use polars::error::PolarsError;
     use polars::frame::DataFrame;
     use polars::prelude::{self as pl, DataType, IntoLazy, Schema as PlSchema, UnionArgs};
-    use polars_plan::plans::ScanSources;
-    use polars_utils::mmap::MemSlice;
 
     use super::AvroScanner;
     use crate::Error;
 
-    fn from_paths(paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> ScanSources {
-        ScanSources::Paths(
-            paths
-                .into_iter()
-                .map(std::convert::Into::into)
-                .collect::<Box<[_]>>()
-                .into(),
-        )
-    }
-
-    fn read_scan(scanner: AvroScanner) -> DataFrame {
+    fn read_scan<R: Read, E>(
+        scanner: AvroScanner<R, impl Iterator<Item = Result<R, E>>>,
+    ) -> DataFrame
+    where
+        Error: From<E>,
+    {
         let frames: Vec<_> = scanner
             .into_iter(1024, None)
             .map(|part| part.unwrap().lazy())
@@ -245,29 +288,21 @@ mod tests {
             .unwrap()
     }
 
-    /// Test scan on a simple file
-    #[test]
-    fn test_scan() {
-        let scanner = AvroScanner::new_from_sources(
-            &from_paths(["./resources/food.avro"]),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        let frame = read_scan(scanner);
-        assert_eq!(frame.height(), 27);
-        assert_eq!(frame.schema().len(), 4);
+    impl From<std::io::Error> for Error {
+        fn from(err: std::io::Error) -> Self {
+            Error::Polars(PolarsError::IO {
+                error: Arc::new(err),
+                msg: None,
+            })
+        }
     }
 
-    /// Test support for globbing
+    /// Test scan on a simple fil
     #[test]
-    fn test_glob() {
-        let scanner =
-            AvroScanner::new_from_sources(&from_paths(["./resources/*.avro"]), true, None, None)
-                .unwrap();
+    fn test_scan() {
+        let scanner = AvroScanner::try_new([File::open("./resources/food.avro")], None).unwrap();
         let frame = read_scan(scanner);
-        assert_eq!(frame.height(), 30);
+        assert_eq!(frame.height(), 27);
         assert_eq!(frame.schema().len(), 4);
     }
 
@@ -293,14 +328,8 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         read_scan(scanner);
     }
 
@@ -326,14 +355,8 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let result = read_scan(scanner);
         let expected = df! {
             "field" => [&b"0123"[..]]
@@ -367,14 +390,8 @@ mod tests {
             ]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
         let expected = df! {
             "millis" => [
@@ -395,13 +412,8 @@ mod tests {
         let mut writer = Writer::new(&Schema::Boolean, &mut buff);
         writer.append(true).unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        );
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
     }
 
@@ -427,15 +439,8 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
         let base = df! {
             "key" => ["key"],
@@ -474,14 +479,8 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-
-        let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        );
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
     }
 
@@ -507,14 +506,8 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
         assert_eq!(
             **frame.schema(),
@@ -541,14 +534,8 @@ mod tests {
             .append(Value::Record(vec![("field".into(), Value::Int(0))]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let iter = scanner.try_into_iter(1024, Some(&["missing"]));
         assert!(matches!(
             iter,
@@ -566,13 +553,8 @@ mod tests {
         writer.append(Value::Int(1)).unwrap();
         writer.append(Value::Int(4)).unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let res = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        );
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
     }
 
@@ -586,14 +568,8 @@ mod tests {
         writer.append(Value::Int(1)).unwrap();
         writer.append(Value::Int(4)).unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            Some("col".into()),
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], Some("col".into())).unwrap();
         let frame = read_scan(scanner);
         let expected = df! {
             "col" => [0, 1, 4]
@@ -684,14 +660,8 @@ mod tests {
             ]))
             .unwrap();
         writer.flush().unwrap();
-        let bytes = buff.into_inner();
-        let scanner = AvroScanner::new_from_sources(
-            &ScanSources::Buffers(vec![MemSlice::from_vec(bytes)].into()),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
+        buff.seek(SeekFrom::Start(0)).unwrap();
+        let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
         assert_eq!(frame.height(), 1);
         assert_eq!(frame.width(), 6);

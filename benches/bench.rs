@@ -8,8 +8,6 @@ use polars::prelude::{DataFrame, df};
 use polars_avro::{AvroScanner, WriteOptions, sink_avro};
 use polars_io::avro::{AvroReader, AvroWriter};
 use polars_io::{SerReader, SerWriter};
-use polars_plan::plans::ScanSources;
-use polars_utils::mmap::MemSlice;
 use test::Bencher;
 
 fn create_frame(num: i32) -> DataFrame {
@@ -51,15 +49,10 @@ fn bench_read_polars_avro(b: &mut Bencher) {
     sink_avro([frame], &mut buff, WriteOptions::default()).unwrap();
     b.iter(|| {
         test::black_box(
-            AvroScanner::new_from_sources(
-                &ScanSources::Buffers(vec![MemSlice::from_vec(buff.clone())].into()),
-                false,
-                None,
-                None,
-            )
-            .unwrap()
-            .into_iter(1024, None)
-            .collect::<Vec<_>>(),
+            AvroScanner::new([Cursor::new(buff.clone())], None)
+                .unwrap()
+                .into_iter(1024, None)
+                .collect::<Vec<_>>(),
         )
     });
 }

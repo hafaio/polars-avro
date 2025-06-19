@@ -3,15 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from os import path
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO
 
-from polars import CredentialProviderFunction, DataFrame
-from polars.io.cloud.credential_provider._builder import (
-    _init_credential_provider_builder,  # type: ignore[reportPrivateImportUsage]
-)
+from polars import DataFrame
 
-from ._avro_rs import Codec
-from ._avro_rs import write_avro as write_avro_rs
+from ._avro_rs import Codec, write_avro_buff, write_avro_file
 
 
 def write_avro(  # noqa: PLR0913
@@ -24,8 +20,6 @@ def write_avro(  # noqa: PLR0913
     promote_array: bool = True,
     truncate_time: bool = False,
     compression_level: int | None = None,
-    retries: int = 2,
-    credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
     storage_options: Mapping[str, str] | None = None,
 ) -> None:
     """Write a DataFrame to an Avro file.
@@ -47,20 +41,7 @@ def write_avro(  # noqa: PLR0913
     storage_options : Additional options for cloud operations.
     """
     # normalize dest
-    match dest:
-        case str() | Path():
-            normed = path.expanduser(dest)
-        case _:
-            normed = dest
-
     # normalize cloud options
-    cloud_options = None if storage_options is None else [*storage_options.items()]
-    credential_provider_builder = _init_credential_provider_builder(
-        credential_provider,
-        normed,
-        cast(dict[str, str], storage_options),  # incorrect signature
-        "scan_avro",
-    )
 
     # chunk array if batchsize specified
     if batch_size is None:
@@ -71,15 +52,29 @@ def write_avro(  # noqa: PLR0913
             for i in range(0, len(frame), batch_size)
         ]
 
-    write_avro_rs(
-        frames,
-        normed,
-        codec,
-        promote_ints,
-        promote_array,
-        truncate_time,
-        compression_level,
-        cloud_options,
-        credential_provider_builder,
-        retries,
-    )
+    match dest:
+        case str() | Path():
+            expanded = path.expandvars(dest)
+            cloud_options = (
+                None if storage_options is None else [*storage_options.items()]
+            )
+            write_avro_file(
+                frames,
+                expanded,
+                codec,
+                promote_ints,
+                promote_array,
+                truncate_time,
+                compression_level,
+                cloud_options,
+            )
+        case _:
+            write_avro_buff(
+                frames,
+                dest,
+                codec,
+                promote_ints,
+                promote_array,
+                truncate_time,
+                compression_level,
+            )

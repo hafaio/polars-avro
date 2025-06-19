@@ -5,7 +5,6 @@
 
 mod des;
 mod error;
-mod io;
 #[cfg(feature = "pyo3")]
 mod py;
 mod scan;

@@ -4,9 +4,6 @@ from typing import BinaryIO
 
 from polars import DataFrame
 from polars._typing import SchemaDict  # type: ignore[reportPrivateImportUsage]
-from polars.io.cloud.credential_provider._builder import (
-    CredentialProviderBuilder,  # type: ignore[reportPrivateImportUsage]
-)
 
 class Codec:
     """The codec to use when writing Avro files."""
@@ -26,32 +23,38 @@ class AvroSource:
 
     def __init__(
         self,
-        sources: list[str] | list[BinaryIO],
-        glob: bool,
+        paths: list[str],
+        buffs: list[BinaryIO],
         single_col_name: str | None,
-        cloud_options: list[tuple[str, str]] | None,
-        credential_provider: CredentialProviderBuilder | None,
-        retries: int,
-        file_cache_ttl: int | None,
     ) -> None: ...
     def schema(self) -> SchemaDict: ...
     def batch_iter(
         self, batch_size: int, with_columns: list[str] | None
     ) -> AvroIter: ...
 
-def write_avro(
+def write_avro_file(
     frames: list[DataFrame],
-    dest: str | BinaryIO,
+    dest: str,
     codec: Codec,
     promote_ints: bool,
     promote_array: bool,
     truncate_time: bool,
     compression_level: int | None,
     cloud_options: list[tuple[str, str]] | None,
-    credential_provider: CredentialProviderBuilder | None,
-    retries: int,
 ) -> None:
     """Write a DataFrame to an Avro file."""
+    ...
+
+def write_avro_buff(
+    frames: list[DataFrame],
+    buff: BinaryIO,
+    codec: Codec,
+    promote_ints: bool,
+    promote_array: bool,
+    truncate_time: bool,
+    compression_level: int | None,
+) -> None:
+    """Write a DataFrame to bytes."""
     ...
 
 class AvroError(Exception):
