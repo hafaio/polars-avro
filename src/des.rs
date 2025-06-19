@@ -12,7 +12,7 @@ use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
 use polars::prelude::{
     ArrowDataType, CompatLevel, DataType, Field, PlSmallStr, Schema as PlSchema, TimeUnit,
-    create_enum_dtype,
+    TimeZone, create_enum_dtype,
 };
 use polars_arrow::array::{
     Array, MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableDictionaryArray,
@@ -98,13 +98,13 @@ impl DataTypeParser {
             AvroSchema::Date => DataType::Date,
             AvroSchema::TimeMillis | AvroSchema::TimeMicros => DataType::Time,
             AvroSchema::TimestampMillis => {
-                DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))
+                DataType::Datetime(TimeUnit::Milliseconds, Some(TimeZone::UTC))
             }
             AvroSchema::TimestampMicros => {
-                DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))
+                DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))
             }
             AvroSchema::TimestampNanos => {
-                DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into()))
+                DataType::Datetime(TimeUnit::Nanoseconds, Some(TimeZone::UTC))
             }
             AvroSchema::LocalTimestampMillis => DataType::Datetime(TimeUnit::Milliseconds, None),
             AvroSchema::LocalTimestampMicros => DataType::Datetime(TimeUnit::Microseconds, None),

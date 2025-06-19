@@ -95,17 +95,6 @@ def test_file_write(tmp_path: Path) -> None:
     assert frames_equal(frame, duplicate)
 
 
-def test_async_write(tmp_path: Path) -> None:
-    """Test writing to a file url."""
-    file_path = tmp_path / "test.avro"
-    path = f"file://{file_path.absolute()}"
-
-    frame = pl.from_dict({"x": [1]})
-    write_avro(frame, path)
-    duplicate = read_avro(path)
-    assert frames_equal(frame, duplicate)
-
-
 def test_no_int_promotion() -> None:
     """Test exception when writing ints without promotion."""
     buff = BytesIO()

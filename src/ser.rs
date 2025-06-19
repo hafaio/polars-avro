@@ -7,7 +7,9 @@ use apache_avro::schema::{
     UnionSchema,
 };
 use apache_avro::types::Value;
-use polars::prelude::{AnyValue, DataType, Field, RevMapping, Schema as PlSchema, TimeUnit};
+use polars::prelude::{
+    AnyValue, DataType, Field, RevMapping, Schema as PlSchema, TimeUnit, TimeZone,
+};
 
 pub fn try_as_schema(
     schema: &PlSchema,
@@ -164,13 +166,13 @@ impl Serializer {
             DataType::String => AvroSchema::String,
             DataType::Binary => AvroSchema::Bytes,
             DataType::Date => AvroSchema::Date,
-            DataType::Datetime(TimeUnit::Milliseconds, Some(tz)) if tz == "UTC" => {
+            DataType::Datetime(TimeUnit::Milliseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 AvroSchema::TimestampMillis
             }
-            DataType::Datetime(TimeUnit::Microseconds, Some(tz)) if tz == "UTC" => {
+            DataType::Datetime(TimeUnit::Microseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 AvroSchema::TimestampMicros
             }
-            DataType::Datetime(TimeUnit::Nanoseconds, Some(tz)) if tz == "UTC" => {
+            DataType::Datetime(TimeUnit::Nanoseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 AvroSchema::TimestampNanos
             }
             DataType::Datetime(TimeUnit::Milliseconds, None) => AvroSchema::LocalTimestampMillis,
@@ -236,22 +238,28 @@ fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
             &AnyValue::Float32(val) => Value::Float(val),
             &AnyValue::Float64(val) => Value::Double(val),
             &AnyValue::Date(val) => Value::Date(val),
-            &AnyValue::Datetime(val, TimeUnit::Milliseconds, Some(tz)) if tz == "UTC" => {
+            &AnyValue::Datetime(val, TimeUnit::Milliseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 Value::TimestampMillis(val)
             }
-            AnyValue::DatetimeOwned(val, TimeUnit::Milliseconds, Some(tz)) if **tz == "UTC" => {
+            AnyValue::DatetimeOwned(val, TimeUnit::Milliseconds, Some(tz))
+                if **tz == TimeZone::UTC =>
+            {
                 Value::TimestampMillis(*val)
             }
-            &AnyValue::Datetime(val, TimeUnit::Microseconds, Some(tz)) if tz == "UTC" => {
+            &AnyValue::Datetime(val, TimeUnit::Microseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 Value::TimestampMicros(val)
             }
-            AnyValue::DatetimeOwned(val, TimeUnit::Microseconds, Some(tz)) if **tz == "UTC" => {
+            AnyValue::DatetimeOwned(val, TimeUnit::Microseconds, Some(tz))
+                if **tz == TimeZone::UTC =>
+            {
                 Value::TimestampMicros(*val)
             }
-            &AnyValue::Datetime(val, TimeUnit::Nanoseconds, Some(tz)) if tz == "UTC" => {
+            &AnyValue::Datetime(val, TimeUnit::Nanoseconds, Some(tz)) if tz == &TimeZone::UTC => {
                 Value::TimestampNanos(val)
             }
-            AnyValue::DatetimeOwned(val, TimeUnit::Nanoseconds, Some(tz)) if **tz == "UTC" => {
+            AnyValue::DatetimeOwned(val, TimeUnit::Nanoseconds, Some(tz))
+                if **tz == TimeZone::UTC =>
+            {
                 Value::TimestampNanos(*val)
             }
             &AnyValue::Datetime(val, TimeUnit::Milliseconds, None)

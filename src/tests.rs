@@ -5,11 +5,9 @@ use chrono::{NaiveDate, NaiveTime};
 use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
-    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, UnionArgs,
+    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, TimeZone, UnionArgs,
 };
 use polars_arrow::array::{MutableArray, Utf8ViewArray};
-use polars_plan::plans::ScanSources;
-use polars_utils::mmap::MemSlice;
 
 fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
     let mut buff = Cursor::new(Vec::new());
@@ -18,8 +16,7 @@ fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
 }
 
 fn deserialize(buff: Vec<u8>) -> DataFrame {
-    let sources = ScanSources::Buffers(vec![MemSlice::from_vec(buff)].into());
-    let scanner = AvroScanner::new_from_sources(&sources, false, None, None).unwrap();
+    let scanner = AvroScanner::new([Cursor::new(buff)], None).unwrap();
     let schema = scanner.schema();
     let iter = scanner.into_iter(2, None);
     let parts: Vec<_> = iter.map(|part| part.unwrap().lazy()).collect();
@@ -77,9 +74,9 @@ test_transitivity!(test_transitivity_complex: df!(
     .unwrap().lazy().with_columns([
         pl::when(pl::col("name") == "Alice Archer".into()).then(pl::lit(Null {})).otherwise(pl::as_struct(vec![pl::col("name"), pl::col("age")])).alias("combined"),
         pl::col("birthtime").strict_cast(DataType::Date).alias("birthdate"),
-        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, Some("UTC".into()))).alias("birthtime_milli"),
-        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, Some("UTC".into()))).alias("birthtime_micro"),
-        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, Some("UTC".into()))).alias("birthtime_nano"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, Some(TimeZone::UTC))).alias("birthtime_milli"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))).alias("birthtime_micro"),
+        pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, Some(TimeZone::UTC))).alias("birthtime_nano"),
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, None)).alias("birthtime_milli_local"),
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, None)).alias("birthtime_micro_local"),
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, None)).alias("birthtime_nano_local"),
@@ -242,8 +239,7 @@ fn test_different_schemas() {
         WriteOptions::default(),
     );
 
-    let sources = ScanSources::Buffers(vec![one.into(), two.into()].into());
-    let scanner = AvroScanner::new_from_sources(&sources, false, None, None).unwrap();
+    let scanner = AvroScanner::new([Cursor::new(one), Cursor::new(two)], None).unwrap();
     let iter = scanner.into_iter(2, None);
     let parts: Result<Vec<_>, _> = iter.map(|part| part).collect();
     assert!(matches!(parts, Err(Error::NonMatchingSchemas)));

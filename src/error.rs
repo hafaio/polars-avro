@@ -2,6 +2,7 @@
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::io;
 
 use apache_avro::types::Value;
 use apache_avro::{Error as AvroError, Schema};
@@ -37,6 +38,8 @@ pub enum Error {
     InvalidArrowType(DataType, ArrowDataType),
     /// If an avro value didn't match the expected deserializer
     InvalidAvroValue(Value),
+    /// I/O related errors
+    IO(io::Error, String),
 }
 
 impl Display for Error {
@@ -81,6 +84,9 @@ impl Display for Error {
                     f,
                     "Avro value didn't match the expected deserializer: {value:?}",
                 )
+            }
+            Error::IO(err, path) => {
+                write!(f, "Problem with {path}: {err}")
             }
         }
     }

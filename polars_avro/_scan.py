@@ -1,16 +1,25 @@
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
+from glob import iglob
 from os import path
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO
 
 import polars as pl
-from polars import CredentialProviderFunction, DataFrame, Expr, LazyFrame
-from polars.io.cloud.credential_provider._builder import (
-    _init_credential_provider_builder,  # type: ignore[reportPrivateImportUsage]
-)
+from polars import DataFrame, Expr, LazyFrame
 from polars.io.plugins import register_io_source
 
 from ._avro_rs import AvroSource
+
+
+def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
+    """Expand a string or Path to a list of file paths."""
+    expanded = path.expanduser(source)
+    if glob and "*" in expanded:
+        yield from sorted(iglob(expanded))
+    elif path.isdir(expanded):
+        yield from sorted(iglob(path.join(expanded, "*")))
+    else:
+        yield expanded
 
 
 def scan_avro(  # noqa: PLR0913
@@ -19,10 +28,6 @@ def scan_avro(  # noqa: PLR0913
     batch_size: int = 32768,
     glob: bool = True,
     single_col_name: str | None = None,
-    storage_options: Mapping[str, str] | None = None,
-    credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
-    retries: int = 2,
-    file_cache_ttl: int | None = None,
 ) -> LazyFrame:
     """Scan Avro files.
 
@@ -32,45 +37,29 @@ def scan_avro(  # noqa: PLR0913
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files.
     storage_options : Additional options for cloud operations.
-    credential_provider : The credential provider to use for cloud operations.
-        Defaults to "auto" which uses the default credential provider.
-    retries : The number of times to retry cloud operations.
-    file_cache_ttl : The time to live for cached cloud files.
     """
     # normalize sources
+    strs: list[str] = []
+    bins: list[BinaryIO] = []
     match sources:
         case [*_]:
-            strs: list[str] = []
-            bins: list[BinaryIO] = []
             for source in sources:
                 if isinstance(source, str | Path):
-                    strs.append(path.expanduser(source))
+                    strs.extend(expand_str(source, glob=glob))
                 else:
                     bins.append(source)
-            normed = strs or bins
         case str() | Path():
-            normed = [path.expanduser(sources)]
+            strs.extend(expand_str(sources, glob=glob))
         case _:
-            normed = [sources]
+            bins.append(sources)
 
     # normalize cloud options
-    cloud_options = None if storage_options is None else [*storage_options.items()]
-    credential_provider_builder = _init_credential_provider_builder(
-        credential_provider,
-        sources,
-        cast(dict[str, str], storage_options),  # incorrect signature
-        "scan_avro",
-    )
     def_batch_size = batch_size
 
     src = AvroSource(
-        normed,
-        glob,
+        strs,
+        bins,
         single_col_name,
-        cloud_options,
-        credential_provider_builder,
-        retries,
-        file_cache_ttl,
     )
 
     def get_schema() -> pl.Schema:
@@ -113,10 +102,6 @@ def read_avro(  # noqa: PLR0913
     batch_size: int = 32768,
     glob: bool = True,
     single_col_name: str | None = None,
-    storage_options: Mapping[str, str] | None = None,
-    credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
-    retries: int = 2,
-    file_cache_ttl: int | None = None,
 ) -> DataFrame:
     """Read an Avro file into a DataFrame.
 
@@ -141,10 +126,6 @@ def read_avro(  # noqa: PLR0913
         batch_size=batch_size,
         glob=glob,
         single_col_name=single_col_name,
-        storage_options=storage_options,
-        credential_provider=credential_provider,
-        retries=retries,
-        file_cache_ttl=file_cache_ttl,
     )
     if columns is not None:
         lazy = lazy.select(
