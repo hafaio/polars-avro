@@ -257,7 +257,7 @@ def test_noncontiguous_chunks(
             pl.from_dict({"split": [*range(3, 6)]}),
         ],
         rechunk=False,
-    ).with_columns(contig=pl.int_range(pl.len()))
+    ).with_columns(contig=pl.int_range(pl.len()))  # type: ignore
     buff = BytesIO()
     write_func(frame, buff)
     buff.seek(0)

@@ -40,6 +40,7 @@ convention = "numpy"
 addopts = "--cov --cov-report term-missing"
 
 [tool.pyright]
+include = ["polars_avro", "tests"]
 strict = ["polars_avro", "tests"]
 
 [tool.uv]

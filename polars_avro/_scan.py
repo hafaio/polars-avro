@@ -128,7 +128,7 @@ def read_avro(  # noqa: PLR0913
         single_col_name=single_col_name,
     )
     if columns is not None:
-        lazy = lazy.select(
+        lazy = lazy.select(  # type: ignore
             [pl.nth(c) if isinstance(c, int) else pl.col(c) for c in columns]
         )
     if row_index_name is not None:

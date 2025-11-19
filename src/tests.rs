@@ -5,9 +5,10 @@ use chrono::{NaiveDate, NaiveTime};
 use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
-    self as pl, DataFrame, DataType, IntoLazy, Null, Series, TimeUnit, TimeZone, UnionArgs,
+    self as pl, DataFrame, DataType, FrozenCategories, IntoLazy, Null, Series, TimeUnit, TimeZone,
+    UnionArgs,
 };
-use polars_arrow::array::{MutableArray, Utf8ViewArray};
+use polars_arrow::array::MutableArray;
 
 fn serialize(frame: DataFrame, opts: WriteOptions) -> Vec<u8> {
     let mut buff = Cursor::new(Vec::new());
@@ -80,8 +81,8 @@ test_transitivity!(test_transitivity_complex: df!(
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Milliseconds, None)).alias("birthtime_milli_local"),
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Microseconds, None)).alias("birthtime_micro_local"),
         pl::col("birthtime").strict_cast(DataType::Datetime(TimeUnit::Nanoseconds, None)).alias("birthtime_nano_local"),
-        pl::col("rating").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values(["mid", "slay"]))),
-        pl::col("height").strict_cast(DataType::Decimal(Some(15), Some(2))).alias("decimal"),
+        pl::col("rating").strict_cast(DataType::from_frozen_categories(FrozenCategories::new(["mid", "slay"]).unwrap())),
+        pl::col("height").strict_cast(DataType::Decimal(15, 2)).alias("decimal"),
     ]).collect().unwrap()
 );
 
@@ -91,9 +92,9 @@ test_transitivity!(test_transitivity_enum: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("col").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
+        pl::col("col").strict_cast(DataType::from_frozen_categories(FrozenCategories::new([
             "a", "b",
-        ]))),
+        ]).unwrap())),
     ])
     .collect()
     .unwrap()
@@ -106,12 +107,12 @@ test_transitivity!(test_transitivity_double_enum: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("one").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
+        pl::col("one").strict_cast(DataType::from_frozen_categories(FrozenCategories::new([
             "a", "b",
-        ]))),
-        pl::col("two").strict_cast(pl::create_enum_dtype(Utf8ViewArray::from_slice_values([
+        ]).unwrap())),
+        pl::col("two").strict_cast(DataType::from_frozen_categories(FrozenCategories::new([
             "d", "c",
-        ]))),
+        ]).unwrap())),
     ])
     .collect()
     .unwrap()
@@ -124,8 +125,8 @@ test_transitivity!(test_transitivity_double_decimal: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::col("one").strict_cast(DataType::Decimal(Some(3), Some(1))),
-        pl::col("two").strict_cast(DataType::Decimal(Some(16), Some(6))),
+        pl::col("one").strict_cast(DataType::Decimal(3, 1)),
+        pl::col("two").strict_cast(DataType::Decimal(16, 6)),
     ])
     .collect()
     .unwrap()
@@ -152,10 +153,9 @@ test_transitivity!(test_transitivity_enum_struct: df! {
     .unwrap()
     .lazy()
     .select([
-        pl::as_struct(vec![pl::col("one").strict_cast(pl::create_enum_dtype(
-            Utf8ViewArray::from_slice_values([
+        pl::as_struct(vec![pl::col("one").strict_cast(DataType::from_frozen_categories(FrozenCategories::new([
                 "a", "b",
-            ])
+            ]).unwrap()
         )), pl::col("two")]).alias("col"),
     ])
     .collect()

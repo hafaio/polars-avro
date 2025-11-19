@@ -108,6 +108,7 @@ impl From<PolarsError> for Error {
 
 #[cfg(test)]
 mod tests {
+    use apache_avro::error::Details;
     use apache_avro::{Error as AvroError, Schema, types::Value};
     use polars::error::PolarsError;
     use polars::prelude::{ArrowDataType, DataType};
@@ -118,7 +119,7 @@ mod tests {
     fn test_display() {
         for err in [
             Error::Polars(PolarsError::NoData("test".into())),
-            Error::Avro(Box::new(AvroError::EmptyUnion)),
+            Error::Avro(Box::new(AvroError::new(Details::EmptyUnion))),
             Error::EmptySources,
             Error::NonRecordSchema(Box::new(Schema::Null)),
             Error::UnsupportedAvroType(Box::new(Schema::Null)),
