@@ -11,13 +11,12 @@ use apache_avro::schema::{
 use apache_avro::types::Value;
 use polars::error::{PolarsError, PolarsResult};
 use polars::prelude::{
-    ArrowDataType, CompatLevel, DataType, Field, PlSmallStr, Schema as PlSchema, TimeUnit,
-    TimeZone, create_enum_dtype,
+    ArrowDataType, CompatLevel, DataType, Field, FrozenCategories, PlSmallStr, Schema as PlSchema,
+    TimeUnit, TimeZone,
 };
 use polars_arrow::array::{
     Array, MutableArray, MutableBinaryViewArray, MutableBooleanArray, MutableDictionaryArray,
     MutableListArray, MutableNullArray, MutablePrimitiveArray, StructArray, TryExtend, TryPush,
-    Utf8ViewArray,
 };
 use polars_arrow::bitmap::MutableBitmap;
 
@@ -83,7 +82,8 @@ impl DataTypeParser {
             }
             AvroSchema::Enum(EnumSchema { symbols, name, .. }) => {
                 let fullname = name.fullname(None);
-                let dtype = create_enum_dtype(Utf8ViewArray::from_slice_values(symbols));
+                let categories = FrozenCategories::new(symbols.iter().map(String::as_ref))?;
+                let dtype = DataType::from_frozen_categories(categories);
                 let old = self.names.insert(fullname, dtype.clone());
                 debug_assert!(old.is_none(), "found duplicate name {name:?}");
                 dtype
@@ -123,7 +123,7 @@ impl DataTypeParser {
             }
             &AvroSchema::Decimal(DecimalSchema {
                 precision, scale, ..
-            }) => DataType::Decimal(Some(precision), Some(scale)),
+            }) => DataType::Decimal(precision, scale),
             AvroSchema::Ref { name } => {
                 let resolved = name.fullname(None);
                 if let Some(referenced) = self.names.get(&resolved) {
@@ -330,7 +330,7 @@ impl ValueBuilder for MutablePrimitiveArray<i128> {
     }
 }
 
-impl ValueBuilder for MutableDictionaryArray<u32, MutableBinaryViewArray<str>> {
+impl ValueBuilder for MutableDictionaryArray<u8, MutableBinaryViewArray<str>> {
     fn try_push_value(&mut self, value: &Value) -> PolarsResult<()> {
         match unwrap_union(value) {
             Value::Null => self.push_null(),
@@ -637,7 +637,7 @@ pub fn new_value_builder(dtype: &DataType, capacity: usize) -> Box<dyn ValueBuil
             )
             .unwrap(),
         ),
-        &DataType::Decimal(Some(precision), Some(scale)) => Box::new(
+        &DataType::Decimal(precision, scale) => Box::new(
             MutablePrimitiveArray::<i128>::try_new(
                 ArrowDataType::Decimal(precision, scale),
                 Vec::with_capacity(capacity),
@@ -649,16 +649,16 @@ pub fn new_value_builder(dtype: &DataType, capacity: usize) -> Box<dyn ValueBuil
         DataType::Float64 => Box::new(MutablePrimitiveArray::<f64>::with_capacity(capacity)),
         DataType::String => Box::new(MutableBinaryViewArray::<str>::with_capacity(capacity)),
         DataType::Binary => Box::new(MutableBinaryViewArray::<[u8]>::with_capacity(capacity)),
-        DataType::Enum(revmap, _) | DataType::Categorical(revmap, _) => {
-            let num = revmap.as_ref().map_or_else(|| 0, |rv| rv.len());
+        DataType::Enum(_, mapping) | DataType::Categorical(_, mapping) => {
+            let num = mapping.num_cats_upper_bound();
             let mut vals = MutableBinaryViewArray::<str>::with_capacity(num);
-            // NOTE ideally we should be able to copy back into mutability efficiently
-            if let Some(revmap) = revmap {
-                vals.extend(revmap.get_categories().iter());
+            for cat in 0..u32::try_from(num).expect("enum values didn't fit in u32") {
+                let cat_str = mapping.cat_to_str(cat).unwrap_or_default();
+                vals.push_value_ignore_validity(cat_str);
             }
             // NOTE fails if there are more than u32 values, or they're non-unique, but these are guaranteed by avro spec
             let mut array =
-                MutableDictionaryArray::<u32, MutableBinaryViewArray<str>>::from_values(vals)
+                MutableDictionaryArray::<u8, MutableBinaryViewArray<str>>::from_values(vals)
                     .unwrap();
             array.reserve(capacity);
             Box::new(array)
@@ -781,7 +781,7 @@ mod tests {
         let mut builder = MutablePrimitiveArray::<f64>::new();
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
-        let mut builder = MutableDictionaryArray::<u32, MutableBinaryViewArray<str>>::new();
+        let mut builder = MutableDictionaryArray::<u8, MutableBinaryViewArray<str>>::new();
         assert!(builder.try_push_value(&Value::Boolean(true)).is_err());
 
         let mut builder = MutableBinaryViewArray::<[u8]>::new();

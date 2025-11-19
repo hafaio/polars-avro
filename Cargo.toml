@@ -19,7 +19,7 @@ pyo3 = [
 ]
 
 [dependencies]
-polars = { version = "0.48.1", default-features = false, features = [
+polars = { version = "0.52.0", default-features = false, features = [
     "dtype-array",
     "dtype-categorical",
     "dtype-date",
@@ -34,21 +34,22 @@ polars = { version = "0.48.1", default-features = false, features = [
     "lazy",
     "timezones",
 ] }
-apache-avro = "0.18.0"
-polars-arrow = "0.48.1"
-polars-io = { version = "0.48.1", features = ["file_cache"] }
-polars-plan = { version = "0.48.1", features = ["cloud"] }
-polars-python = { version = "0.48.1", optional = true }
-polars-utils = "0.48.1"
-pyo3 = { version = "0.24.2", optional = true }
-pyo3-polars = { version = "0.21.0", features = [
+apache-avro = "0.21.0"
+polars-arrow = "0.52.0"
+polars-io = { version = "0.52.0", features = ["file_cache"] }
+polars-plan = { version = "0.52.0", features = ["cloud"] }
+polars-python = { version = "0.52.0", optional = true }
+polars-utils = "0.52.0"
+pyo3 = { version = "0.26.0", optional = true }
+pyo3-polars = { version = "0.25.0", features = [
     "lazy",
     "dtype-categorical",
     "dtype-struct",
     "dtype-array",
 ], optional = true }
+miniz_oxide = "0.8.9"
 
 [dev-dependencies]
 chrono = "0.4.40"
-polars = { version = "0.48.1", default-features = false, features = ["fmt"] }
-polars-io = { version = "0.48.1", features = ["file_cache", "avro"] }
+polars = { version = "0.52.0", default-features = false, features = ["fmt"] }
+polars-io = { version = "0.52.0", features = ["file_cache", "avro"] }

@@ -1,18 +1,21 @@
 //! pyo3 bindings
 
+use miniz_oxide::deflate::CompressionLevel;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::iter::{Chain, Fuse};
 use std::sync::Arc;
 
-use apache_avro::{Bzip2Settings, Codec as AvroCodec, XzSettings, ZstandardSettings};
+use apache_avro::{
+    Bzip2Settings, Codec as AvroCodec, DeflateSettings, XzSettings, ZstandardSettings,
+};
 use polars::prelude::file::Writeable;
-use polars::prelude::{PlSmallStr, Schema};
+use polars::prelude::{PlPathRef, PlSmallStr, Schema};
 use polars_io::cloud::CloudOptions;
 use pyo3::exceptions::{PyException, PyIOError, PyRuntimeError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
 use pyo3::{
-    Bound, PyErr, PyObject, PyResult, Python, create_exception, pyclass, pyfunction, pymethods,
+    Bound, Py, PyAny, PyErr, PyResult, Python, create_exception, pyclass, pyfunction, pymethods,
     pymodule, wrap_pyfunction,
 };
 use pyo3_polars::error::PyPolarsErr;
@@ -34,12 +37,12 @@ impl Read for ScanSource {
     }
 }
 struct BytesIter {
-    buffs: Arc<[Arc<PyObject>]>,
+    buffs: Arc<[Arc<Py<PyAny>>]>,
     idx: usize,
 }
 
 impl BytesIter {
-    fn new(buffs: Arc<[Arc<PyObject>]>) -> Self {
+    fn new(buffs: Arc<[Arc<Py<PyAny>>]>) -> Self {
         Self { buffs, idx: 0 }
     }
 }
@@ -93,11 +96,11 @@ impl PyAvroIter {
     }
 }
 
-struct PyReader(Arc<PyObject>);
+struct PyReader(Arc<Py<PyAny>>);
 
 impl Read for PyReader {
     fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let res = self.0.bind(py).call_method1("read", (buf.len(),))?;
             let bytes = res.downcast_into::<PyBytes>()?;
             let raw = bytes.as_bytes();
@@ -108,11 +111,11 @@ impl Read for PyReader {
     }
 }
 
-struct PyWriter(PyObject);
+struct PyWriter(Py<PyAny>);
 
 impl Write for PyWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // let inp = PyBytes::new(py, buf); // FIXME necessarry?
             let res = self.0.bind(py).call_method1("write", (buf,))?;
             res.extract()
@@ -121,7 +124,7 @@ impl Write for PyWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.0.bind(py).call_method0("flush")?;
             Ok(())
         })
@@ -132,13 +135,13 @@ impl Write for PyWriter {
 impl Seek for PyWriter {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
-            SeekFrom::Start(pos) => Python::with_gil(|py| {
+            SeekFrom::Start(pos) => Python::attach(|py| {
                 let writer = self.0.bind(py);
                 let res = writer.call_method1("seek", (pos,))?;
                 res.extract()
             })
             .map_err(|err: PyErr| io::Error::other(err.to_string())),
-            SeekFrom::Current(offset) => Python::with_gil(|py| {
+            SeekFrom::Current(offset) => Python::attach(|py| {
                 let writer = self.0.bind(py);
                 let res = writer.call_method0("tell")?;
                 let current: u64 = res.extract()?;
@@ -162,7 +165,7 @@ impl Seek for PyWriter {
 #[pyclass]
 pub struct AvroSource {
     paths: Arc<[String]>,
-    buffs: Arc<[Arc<PyObject>]>,
+    buffs: Arc<[Arc<Py<PyAny>>]>,
     single_col_name: Option<PlSmallStr>,
     schema: Option<Arc<Schema>>,
     last_scanner: Option<AvroScanner<ScanSource, SourceIter>>,
@@ -192,7 +195,7 @@ impl AvroSource {
 impl AvroSource {
     #[new]
     #[pyo3(signature = (paths, buffs, single_col_name))]
-    fn new(paths: Vec<String>, buffs: Vec<PyObject>, single_col_name: Option<String>) -> Self {
+    fn new(paths: Vec<String>, buffs: Vec<Py<PyAny>>, single_col_name: Option<String>) -> Self {
         Self {
             paths: paths.into(),
             buffs: buffs.into_iter().map(Arc::new).collect(),
@@ -249,7 +252,18 @@ enum Codec {
 fn create_codec(codec: Codec, compression_level: Option<u8>) -> AvroCodec {
     match codec {
         Codec::Null => AvroCodec::Null,
-        Codec::Deflate => AvroCodec::Deflate,
+        Codec::Deflate => AvroCodec::Deflate(if let Some(compression_level) = compression_level {
+            DeflateSettings::new(match compression_level {
+                0 => CompressionLevel::NoCompression,
+                1 => CompressionLevel::BestSpeed,
+                9 => CompressionLevel::BestCompression,
+                10 => CompressionLevel::UberCompression,
+                6 => CompressionLevel::DefaultLevel,
+                _ => CompressionLevel::DefaultCompression,
+            })
+        } else {
+            DeflateSettings::default()
+        }),
         Codec::Snappy => AvroCodec::Snappy,
         Codec::Bzip2 => AvroCodec::Bzip2(if let Some(compression_level) = compression_level {
             Bzip2Settings { compression_level }
@@ -285,8 +299,11 @@ fn write_avro_file(
     compression_level: Option<u8>,
     cloud_options: Option<Vec<(String, String)>>,
 ) -> PyResult<()> {
-    let options = CloudOptions::from_untyped_config(dest, cloud_options.unwrap_or_default())
-        .map_err(PyPolarsErr::from)?;
+    let dest = PlPathRef::new(dest);
+    let scheme = dest.as_cloud_path().map(|cp| cp.scheme());
+    let options =
+        CloudOptions::from_untyped_config(scheme.as_ref(), cloud_options.unwrap_or_default())
+            .map_err(PyPolarsErr::from)?;
     let mut write = Writeable::try_new(dest, Some(&options)).map_err(PyPolarsErr::from)?;
     sink_avro(
         frames.into_iter().map(|PyDataFrame(frame)| frame),
@@ -306,7 +323,7 @@ fn write_avro_file(
 #[allow(clippy::too_many_arguments)]
 fn write_avro_buff(
     frames: Vec<PyDataFrame>,
-    buff: PyObject,
+    buff: Py<PyAny>,
     codec: Codec,
     promote_ints: bool,
     promote_array: bool,

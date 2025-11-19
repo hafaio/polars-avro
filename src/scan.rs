@@ -259,6 +259,7 @@ where
 mod tests {
     use std::fs::File;
     use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::mem;
     use std::sync::Arc;
 
     use apache_avro::types::Value;
@@ -328,6 +329,7 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         read_scan(scanner);
@@ -355,6 +357,7 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let result = read_scan(scanner);
@@ -390,6 +393,7 @@ mod tests {
             ]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
@@ -412,6 +416,7 @@ mod tests {
         let mut writer = Writer::new(&Schema::Boolean, &mut buff);
         writer.append(true).unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
@@ -439,6 +444,7 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
@@ -479,6 +485,7 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
@@ -506,6 +513,7 @@ mod tests {
             )]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);
@@ -534,6 +542,7 @@ mod tests {
             .append(Value::Record(vec![("field".into(), Value::Int(0))]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let iter = scanner.try_into_iter(1024, Some(&["missing"]));
@@ -548,11 +557,13 @@ mod tests {
     fn test_non_record() {
         let mut buff = Cursor::new(Vec::new());
         let schema = Schema::parse_str(r#""int""#).unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer.append(Value::Int(0)).unwrap();
-        writer.append(Value::Int(1)).unwrap();
-        writer.append(Value::Int(4)).unwrap();
-        writer.flush().unwrap();
+        {
+            let mut writer = Writer::new(&schema, &mut buff);
+            writer.append(Value::Int(0)).unwrap();
+            writer.append(Value::Int(1)).unwrap();
+            writer.append(Value::Int(4)).unwrap();
+            writer.flush().unwrap();
+        }
         buff.seek(SeekFrom::Start(0)).unwrap();
         let res = AvroScanner::new([buff], None);
         assert!(matches!(res, Err(Error::NonRecordSchema(_))));
@@ -568,6 +579,7 @@ mod tests {
         writer.append(Value::Int(1)).unwrap();
         writer.append(Value::Int(4)).unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], Some("col".into())).unwrap();
         let frame = read_scan(scanner);
@@ -660,6 +672,7 @@ mod tests {
             ]))
             .unwrap();
         writer.flush().unwrap();
+        mem::drop(writer);
         buff.seek(SeekFrom::Start(0)).unwrap();
         let scanner = AvroScanner::new([buff], None).unwrap();
         let frame = read_scan(scanner);

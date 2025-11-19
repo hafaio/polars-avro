@@ -36,7 +36,7 @@ def test_scan_avro() -> None:
 def test_projection_pushdown_avro() -> None:
     """Test that projection is pushed down to scan."""
     file_path = "resources/food.avro"
-    lazy = scan_avro(file_path).select(pl.col.calories)
+    lazy = scan_avro(file_path).select(pl.col.calories)  # type: ignore
 
     explain = lazy.explain()
 
@@ -189,7 +189,7 @@ def test_read_map_type() -> None:
     )
     buff.seek(0)
     # we need to sort the list to guarantee order for comparison
-    res = scan_avro(buff).select(pl.col("map").list.sort()).collect()
+    res = scan_avro(buff).select(pl.col("map").list.sort()).collect()  # type: ignore
     expected = pl.from_dict(
         {"map": [[["a", 5]], None, [["c", 8], ["f", -10]]]},
         schema={"map": pl.List(pl.Struct({"key": pl.String, "value": pl.Int32}))},

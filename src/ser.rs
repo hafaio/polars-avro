@@ -8,7 +8,7 @@ use apache_avro::schema::{
 };
 use apache_avro::types::Value;
 use polars::prelude::{
-    AnyValue, DataType, Field, RevMapping, Schema as PlSchema, TimeUnit, TimeZone,
+    AnyValue, CategoricalMapping, DataType, Field, Schema as PlSchema, TimeUnit, TimeZone,
 };
 
 pub fn try_as_schema(
@@ -75,7 +75,11 @@ impl Serializer {
         res
     }
 
-    fn create_enum_schema(&mut self, rev_mapping: &RevMapping) -> Result<EnumSchema, Error> {
+    fn create_enum_schema(&mut self, mapping: &CategoricalMapping) -> Result<EnumSchema, Error> {
+        let num_cats = mapping
+            .num_cats_upper_bound()
+            .try_into()
+            .map_err(|_| Error::NullEnum)?;
         Ok(EnumSchema {
             name: Name {
                 name: format!("polars_avro_enum_{}", self.inc()),
@@ -83,10 +87,13 @@ impl Serializer {
             },
             aliases: None,
             doc: None,
-            symbols: rev_mapping
-                .get_categories()
-                .iter()
-                .map(|val| val.map(str::to_string).ok_or(Error::NullEnum))
+            symbols: (0..num_cats)
+                .map(|cat| {
+                    mapping
+                        .cat_to_str(cat)
+                        .map(str::to_string)
+                        .ok_or(Error::NullEnum)
+                })
                 .collect::<Result<_, _>>()?,
             default: None,
             attributes: BTreeMap::new(),
@@ -160,7 +167,7 @@ impl Serializer {
             DataType::Int64 => AvroSchema::Long,
             DataType::Float32 => AvroSchema::Float,
             DataType::Float64 => AvroSchema::Double,
-            &DataType::Decimal(Some(precision), Some(scale)) => {
+            &DataType::Decimal(precision, scale) => {
                 AvroSchema::Decimal(self.create_decimal_schema(precision, scale))
             }
             DataType::String => AvroSchema::String,
@@ -183,12 +190,8 @@ impl Serializer {
                 AvroSchema::array(self.try_as_schema(elem_type)?)
             }
             DataType::List(elem_type) => AvroSchema::array(self.try_as_schema(elem_type)?),
-            DataType::Categorical(rev_mapping, _) | DataType::Enum(rev_mapping, _) => {
-                if let Some(rev_mapping) = rev_mapping {
-                    AvroSchema::Enum(self.create_enum_schema(rev_mapping)?)
-                } else {
-                    return Err(Error::NullEnum);
-                }
+            DataType::Categorical(_, mapping) | DataType::Enum(_, mapping) => {
+                AvroSchema::Enum(self.create_enum_schema(mapping)?)
             }
             DataType::Struct(fields) => AvroSchema::Record(self.create_record_schema(fields)?),
             // wildcard to cover different features
@@ -214,6 +217,7 @@ pub fn try_as_value(schema: &PlSchema, record: &[AnyValue]) -> Result<Value, Err
     Ok(Value::Record(mapped?))
 }
 
+#[allow(clippy::too_many_lines)]
 fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
     if let DataType::Null = dtype {
         // if datatype is null, only value is null
@@ -234,7 +238,7 @@ fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
             &AnyValue::Int16(val) => Value::Int(i32::from(val)),
             &AnyValue::Int32(val) => Value::Int(val),
             &AnyValue::Int64(val) => Value::Long(val),
-            AnyValue::Decimal(val, _) => Value::Decimal(val.to_be_bytes().into()),
+            AnyValue::Decimal(val, _, _) => Value::Decimal(val.to_be_bytes().into()),
             &AnyValue::Float32(val) => Value::Float(val),
             &AnyValue::Float64(val) => Value::Double(val),
             &AnyValue::Date(val) => Value::Date(val),
@@ -275,12 +279,24 @@ fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
                 Value::LocalTimestampNanos(val)
             }
             &AnyValue::Time(val) => Value::TimeMicros((val + 500) / 1000),
-            &AnyValue::Categorical(val, rev_mapping, _) | &AnyValue::Enum(val, rev_mapping, _) => {
-                Value::Enum(val, rev_mapping.get(val).to_owned())
-            }
-            AnyValue::CategoricalOwned(val, rev_mapping, _)
-            | AnyValue::EnumOwned(val, rev_mapping, _) => {
-                Value::Enum(*val, rev_mapping.get(*val).to_owned())
+            // NOTE these indixes should be safe, so potentially we could use
+            // cat_to_str_unchecked, but I don't know enough about the safety to
+            // enforce it.
+            &AnyValue::Categorical(val, mapping) | &AnyValue::Enum(val, mapping) => Value::Enum(
+                val,
+                mapping
+                    .cat_to_str(val)
+                    .expect("invalid enum category")
+                    .to_owned(),
+            ),
+            AnyValue::CategoricalOwned(val, mapping) | AnyValue::EnumOwned(val, mapping) => {
+                Value::Enum(
+                    *val,
+                    mapping
+                        .cat_to_str(*val)
+                        .expect("invalid categorical category")
+                        .to_owned(),
+                )
             }
             AnyValue::List(series) | AnyValue::Array(series, _) => {
                 if let DataType::List(etype) | DataType::Array(etype, _) = dtype {
