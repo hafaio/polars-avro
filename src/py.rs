@@ -116,7 +116,8 @@ struct PyWriter(Py<PyAny>);
 impl Write for PyWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         Python::attach(|py| {
-            // let inp = PyBytes::new(py, buf); // FIXME necessarry?
+            // FIXME necessary?
+            // let inp = PyBytes::new(py, buf);
             let res = self.0.bind(py).call_method1("write", (buf,))?;
             res.extract()
         })
@@ -285,7 +286,7 @@ fn create_codec(codec: Codec, compression_level: Option<u8>) -> AvroCodec {
     }
 }
 
-// TODO Add credentials when stabalized
+// TODO Add credentials when stabilized
 #[pyfunction]
 #[pyo3(signature = (frames, dest, codec, promote_ints, promote_array, truncate_time, compression_level, cloud_options))]
 #[allow(clippy::too_many_arguments)]

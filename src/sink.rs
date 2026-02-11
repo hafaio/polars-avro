@@ -113,7 +113,7 @@ mod tests {
         assert!(matches!(res, Error::NonMatchingSchemas));
     }
 
-    /// since types are upcase to i32s, these are still compatable
+    /// since types are upcast to i32s, these are still compatible
     #[test]
     fn test_promote_error() {
         let dest = Cursor::new(Vec::new());

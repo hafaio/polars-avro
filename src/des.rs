@@ -1,4 +1,4 @@
-//! Utilidies for deserializing from from avro.
+//! Utilities for deserializing from avro.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -22,7 +22,7 @@ use polars_arrow::bitmap::MutableBitmap;
 
 /// Name of mapping key when converted to entries
 const KEY_FIELD: &str = "key";
-/// Name of mapping value when convered to entries
+/// Name of mapping value when converted to entries
 const VALUE_FIELD: &str = "value";
 
 pub fn try_from_schema(
