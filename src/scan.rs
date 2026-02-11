@@ -235,7 +235,7 @@ where
             self.read_columns(0..self.schema.len())?
         };
 
-        Ok(DataFrame::new(columns)?)
+        Ok(DataFrame::new_infer_height(columns)?)
     }
 }
 
@@ -249,7 +249,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.read_frame() {
-            Ok(frame) if frame.is_empty() => None,
+            Ok(frame) if frame.height() == 0 => None,
             res => Some(res),
         }
     }
