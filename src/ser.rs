@@ -206,7 +206,7 @@ impl Serializer {
 
 // NOTE we first convert rows to AnyValue, then convert those to Value's then
 // serialize those. We could be lazier and read values "natively" by downcasting
-// Arrays, bur we'll still need to convert to Value's so the overhear of first
+// Arrays, but we'll still need to convert to Value's so the overhead of first
 // converting to AnyValue is minimal.
 pub fn try_as_value(schema: &PlSchema, record: &[AnyValue]) -> Result<Value, Error> {
     let mapped: Result<Vec<_>, Error> = schema
@@ -279,7 +279,7 @@ fn as_value(dtype: &DataType, value: &AnyValue) -> Value {
                 Value::LocalTimestampNanos(val)
             }
             &AnyValue::Time(val) => Value::TimeMicros((val + 500) / 1000),
-            // NOTE these indixes should be safe, so potentially we could use
+            // NOTE these indices should be safe, so potentially we could use
             // cat_to_str_unchecked, but I don't know enough about the safety to
             // enforce it.
             &AnyValue::Categorical(val, mapping) | &AnyValue::Enum(val, mapping) => Value::Enum(

@@ -1,4 +1,4 @@
-//! Polars pluging for reading and writing Apache avro files
+//! Polars plugin for reading and writing Apache avro files
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
