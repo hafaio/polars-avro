@@ -1,5 +1,6 @@
 //! Rust scan implementation
 
+use std::convert::Infallible;
 use std::io::Read;
 use std::iter::{Fuse, FusedIterator};
 use std::sync::Arc;
@@ -22,29 +23,26 @@ pub struct AvroScanner<R, I> {
     single_column_name: Option<PlSmallStr>,
 }
 
-// FIXME move into module since we need to expose it
-pub enum Infallable {}
-
-impl From<Infallable> for Error {
-    fn from(_: Infallable) -> Self {
-        unreachable!()
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }
 
-pub struct InfallableIter<I>(I);
+pub struct InfallibleIter<I>(I);
 
-impl<I: Iterator> Iterator for InfallableIter<I> {
-    type Item = Result<I::Item, Infallable>;
+impl<I: Iterator> Iterator for InfallibleIter<I> {
+    type Item = Result<I::Item, Infallible>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(Result::Ok)
     }
 }
 
-impl<I: ExactSizeIterator> ExactSizeIterator for InfallableIter<I> {}
-impl<I: FusedIterator> FusedIterator for InfallableIter<I> {}
+impl<I: ExactSizeIterator> ExactSizeIterator for InfallibleIter<I> {}
+impl<I: FusedIterator> FusedIterator for InfallibleIter<I> {}
 
-impl<R, I> AvroScanner<R, InfallableIter<I>>
+impl<R, I> AvroScanner<R, InfallibleIter<I>>
 where
     R: Read,
     I: Iterator<Item = R>,
@@ -58,7 +56,7 @@ where
         sources: impl IntoIterator<IntoIter = I>,
         single_column_name: Option<PlSmallStr>,
     ) -> Result<Self, Error> {
-        Self::try_new(InfallableIter(sources.into_iter()), single_column_name)
+        Self::try_new(InfallibleIter(sources.into_iter()), single_column_name)
     }
 }
 
@@ -298,7 +296,7 @@ mod tests {
         }
     }
 
-    /// Test scan on a simple fil
+    /// Test scan on a simple file
     #[test]
     fn test_scan() {
         let scanner = AvroScanner::try_new([File::open("./resources/food.avro")], None).unwrap();

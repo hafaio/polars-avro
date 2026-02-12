@@ -10,10 +10,10 @@ Polars is deprecating support for reading and writing avro files, and this
 plugin fills in support. Currently it's about 7x slower at reading avro files
 and up to 20x slower at writing files.
 
-The reason it's slower is beause this uses the apache rust library, which is
-fully complaint, but does a lot of unnecessary memory allocation and object
-creation that the polars implementaiton avoids. However, this is likely not a
-bottlneck, so the benefits of the standard implementation seem to outweight the
+The reason it's slower is because this uses the apache rust library, which is
+fully compliant, but does a lot of unnecessary memory allocation and object
+creation that the polars implementation avoids. However, this is likely not a
+bottleneck, so the benefits of the standard implementation seem to outweigh the
 added computation.
 
 In exchange for speed you get:
@@ -63,16 +63,16 @@ sink_avro(
 > rust these features need to be enabled manually, e.g. `apache-avro/bzip` to
 > enable bzip2 compression. Decompression is handled automatically.
 
-## Idiosyncorcies
+## Idiosyncrasies
 
 Avro and Arrow don't align fully, and polars only supports a subset of arrow.
-This library tries to allow you to serialize tow avro and deserialize from avro.
+This library tries to allow you to serialize to avro and deserialize from avro.
 Trying to do both means that many types will change at each pass due to the way
 serde works.
 
 1. Avro only supports time with at most microsecond resolution, polars only
    supports time with nanosecond resolution, so writing times values truncates
-   them. You must explicitely allow this behavior.
+   them. You must explicitly allow this behavior.
 2. Avro fixed types don't support storing null values in the individual bytes so
    while a fixed type can be read into a u8 array, it must be serialized back as
    a list of i32s. This may be addressed with polars support for arrow

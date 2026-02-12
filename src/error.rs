@@ -15,7 +15,7 @@ use polars::prelude::{ArrowDataType, DataType};
 pub enum Error {
     /// An error from polars
     Polars(PolarsError),
-    /// An error propogated from the underlying avro library
+    /// An error propagated from the underlying avro library
     Avro(Box<AvroError>), // NOTE AvroErrors are big!
     /// Cannot scan empty sources
     EmptySources,
@@ -23,7 +23,7 @@ pub enum Error {
     NonRecordSchema(Box<Schema>), // NOTE AvroSchema's are big!
     /// Avro and arrow don't share the same types
     UnsupportedAvroType(Box<Schema>), // NOTE AvroSchema's are big!
-    /// Avro and arrow don't share the same types and this type can't be cnverted
+    /// Avro and arrow don't share the same types and this type can't be converted
     ///
     /// There are options for sink that allow promotion or truncation that alter
     /// what types can be serialized
@@ -63,7 +63,7 @@ impl Display for Error {
             Error::UnsupportedPolarsType(dtype) => {
                 write!(
                     f,
-                    "Avro and arrow don't share the same types, this polars type can't be cnverted: {dtype}",
+                    "Avro and arrow don't share the same types, this polars type can't be converted: {dtype}",
                 )
             }
             Error::NullEnum => write!(f, "Polars allows unspecified enums, but avro does not"),
