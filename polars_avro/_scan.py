@@ -13,7 +13,7 @@ from ._avro_rs import AvroSource
 
 def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
     """Expand a string or Path to a list of file paths."""
-    expanded = path.expanduser(source)
+    expanded = path.expanduser(path.expandvars(source))
     if glob and "*" in expanded:
         yield from sorted(iglob(expanded))
     elif path.isdir(expanded):
@@ -25,9 +25,10 @@ def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
 def scan_avro(  # noqa: PLR0913
     sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
     *,
-    batch_size: int = 32768,
+    batch_size: int = 1024,
     glob: bool = True,
-    single_col_name: str | None = None,
+    strict: bool = False,
+    utf8_view: bool = False,
 ) -> LazyFrame:
     """Scan Avro files.
 
@@ -36,7 +37,13 @@ def scan_avro(  # noqa: PLR0913
     sources : The source(s) to scan.
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files.
-    storage_options : Additional options for cloud operations.
+    strict : Whether to use strict mode when parsing avro. Incurs a
+        performance hit.
+    utf8_view : Whether to read strings as views. When ``False`` (default),
+        UUIDs are read as binary and nullable strings preserve nulls. When
+        ``True``, UUIDs are read as formatted strings and nulls in nullable
+        strings are replaced with ``""`` (lossy). Since polars tends to work
+        with string views internally, ``True`` is likely faster.
     """
     # normalize sources
     strs: list[str] = []
@@ -56,11 +63,7 @@ def scan_avro(  # noqa: PLR0913
     # normalize cloud options
     def_batch_size = batch_size
 
-    src = AvroSource(
-        strs,
-        bins,
-        single_col_name,
-    )
+    src = AvroSource(strs, bins)
 
     def get_schema() -> pl.Schema:
         return pl.Schema(src.schema())
@@ -71,7 +74,9 @@ def scan_avro(  # noqa: PLR0913
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[DataFrame]:
-        avro_iter = src.batch_iter(batch_size or def_batch_size, with_columns)
+        avro_iter = src.batch_iter(
+            strict, utf8_view, batch_size or def_batch_size, with_columns
+        )
         while (batch := avro_iter.next()) is not None:
             if predicate is not None:
                 batch = batch.filter(predicate)  # type: ignore
@@ -101,7 +106,8 @@ def read_avro(  # noqa: PLR0913
     rechunk: bool = False,
     batch_size: int = 32768,
     glob: bool = True,
-    single_col_name: str | None = None,
+    strict: bool = False,
+    utf8_view: bool = False,
 ) -> DataFrame:
     """Read an Avro file into a DataFrame.
 
@@ -115,17 +121,20 @@ def read_avro(  # noqa: PLR0913
     rechunk : Whether to rechunk the DataFrame after reading.
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files.
-    storage_options : Additional options for cloud operations.
-    credential_provider : The credential provider to use for cloud operations.
-        Defaults to "auto" which uses the default credential provider.
-    retries : The number of times to retry cloud operations.
-    file_cache_ttl : The time to live for cached cloud files.
+    strict : Whether to use strict mode when parsing avro. Incurs a
+        performance hit.
+    utf8_view : Whether to read strings as views. When ``False`` (default),
+        UUIDs are read as binary and nullable strings preserve nulls. When
+        ``True``, UUIDs are read as formatted strings and nulls in nullable
+        strings are replaced with ``""`` (lossy). Since polars tends to work
+        with string views internally, ``True`` is likely faster.
     """
     lazy = scan_avro(
         sources,
         batch_size=batch_size,
         glob=glob,
-        single_col_name=single_col_name,
+        strict=strict,
+        utf8_view=utf8_view,
     )
     if columns is not None:
         lazy = lazy.select(  # type: ignore

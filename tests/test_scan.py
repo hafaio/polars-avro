@@ -8,8 +8,6 @@ import pytest
 
 from polars_avro import read_avro, scan_avro, write_avro
 
-from .utils import frames_equal
-
 
 def test_scan_avro() -> None:
     """Test generic scan of files."""
@@ -44,8 +42,8 @@ def test_projection_pushdown_avro() -> None:
     assert "PROJECT 1/4 COLUMNS" in explain
 
     normal = lazy.collect()
-    unoptimized = lazy.collect(no_optimization=True)
-    assert frames_equal(normal, unoptimized)
+    unoptimized = lazy.collect(optimizations=pl.QueryOptFlags.none())
+    assert normal.equals(unoptimized)
 
 
 def test_predicate_pushdown_avro() -> None:
@@ -60,8 +58,20 @@ def test_predicate_pushdown_avro() -> None:
     assert """SELECTION: [(col("calories")) > (80)]""" in explain
 
     normal = lazy.collect()
-    unoptimized = lazy.collect(no_optimization=True)
-    assert frames_equal(normal, unoptimized)
+    unoptimized = lazy.collect(optimizations=pl.QueryOptFlags.none())
+    assert normal.equals(unoptimized)
+
+
+def test_many_files() -> None:
+    """Test that scan works with many files."""
+    buff = BytesIO()
+    frame = pl.from_dict({"x": [5, 12, 14]})
+    write_avro(frame, buff)
+
+    buffs = [BytesIO(buff.getvalue()) for _ in range(1023)]
+    res = scan_avro(buffs).collect()
+    reference = pl.from_dict({"x": [5, 12, 14] * 1023})
+    assert res.equals(reference)
 
 
 def test_glob_n_rows() -> None:
@@ -81,24 +91,12 @@ def test_glob_n_rows() -> None:
     }
 
 
-def test_many_files() -> None:
-    """Test that scan works with many files."""
-    buff = BytesIO()
-    frame = pl.from_dict({"x": [5, 12, 14]})
-    write_avro(frame, buff)
-
-    buffs = [BytesIO(buff.getvalue()) for _ in range(1023)]
-    res = scan_avro(buffs).collect()
-    reference = pl.from_dict({"x": [5, 12, 14] * 1023})
-    assert frames_equal(res, reference)
-
-
 def test_scan_nrows_empty() -> None:
     """Test that scan doesn't panic with n_rows set to 0."""
     file_path = "resources/food.avro"
     frame = scan_avro(file_path).head(0).collect()
     reference = read_avro(file_path).head(0)
-    assert frames_equal(frame, reference)
+    assert frame.equals(reference)
 
 
 def test_scan_filter_empty() -> None:
@@ -106,7 +104,7 @@ def test_scan_filter_empty() -> None:
     file_path = "resources/food.avro"
     frame = scan_avro(file_path).filter(pl.col("category") == "empty").collect()  # type: ignore
     reference = read_avro(file_path).filter(pl.col("category") == "empty")  # type: ignore
-    assert frames_equal(frame, reference)
+    assert frame.equals(reference)
 
 
 def test_directory() -> None:
@@ -145,35 +143,39 @@ def test_scan_in_memory() -> None:
 
     buff.seek(0)
     scanned = scan_avro(buff).collect()
-    assert frames_equal(frame, scanned)
+    assert frame.equals(scanned)
 
     buff.seek(0)
     scanned = scan_avro(buff).slice(1, 2).collect()
-    assert frames_equal(frame.slice(1, 2), scanned)
+    assert frame.slice(1, 2).equals(scanned)
 
     buff.seek(0)
     scanned = scan_avro(buff).slice(-1, 1).collect()
-    assert frames_equal(frame.slice(-1, 1), scanned)
+    assert frame.slice(-1, 1).equals(scanned)
 
     other = BytesIO(buff.getvalue())
 
     buff.seek(0)
     scanned = scan_avro([buff, other]).collect()
-    assert frames_equal(pl.concat([frame, frame]), scanned)
+    assert pl.concat([frame, frame]).equals(scanned)
 
     buff.seek(0)
     other.seek(0)
     scanned = scan_avro([buff, other]).slice(1, 3).collect()
-    assert frames_equal(pl.concat([frame, frame]).slice(1, 3), scanned)
+    assert pl.concat([frame, frame]).slice(1, 3).equals(scanned)
 
     buff.seek(0)
     other.seek(0)
     scanned = scan_avro([buff, other]).slice(-4, 3).collect()
-    assert frames_equal(pl.concat([frame, frame]).slice(-4, 3), scanned)
+    assert pl.concat([frame, frame]).slice(-4, 3).equals(scanned)
 
 
 def test_read_map_type() -> None:
-    """Test that we can read a map type."""
+    """Test that we can read a map type.
+
+    Note: arrow-avro reads null map values as empty lists instead of null.
+    This test asserts the actual (imperfect) behavior.
+    """
     buff = BytesIO()
     values = [{"map": {"a": 5}}, {"map": None}, {"map": {"c": 8, "f": -10}}]
     fastavro.writer(  # type: ignore
@@ -190,26 +192,12 @@ def test_read_map_type() -> None:
     buff.seek(0)
     # we need to sort the list to guarantee order for comparison
     res = scan_avro(buff).select(pl.col("map").list.sort()).collect()  # type: ignore
+    # arrow-avro limitation: null map values are read as empty lists
     expected = pl.from_dict(
-        {"map": [[["a", 5]], None, [["c", 8], ["f", -10]]]},
+        {"map": [[["a", 5]], [], [["c", 8], ["f", -10]]]},
         schema={"map": pl.List(pl.Struct({"key": pl.String, "value": pl.Int32}))},
     )
-    assert frames_equal(res, expected)
-
-
-def test_single_col() -> None:
-    """Test that we can read a map type."""
-    buff = BytesIO()
-    fastavro.writer(buff, "int", [1, 2, 10])  # type: ignore
-
-    buff.seek(0)
-    with pytest.raises(Exception, match="top level avro schema must be a record"):
-        read_avro(buff)
-
-    buff.seek(0)
-    res = read_avro(buff, single_col_name="col")
-    expected = pl.from_dict({"col": [1, 2, 10]})
-    assert frames_equal(res, expected)
+    assert res.equals(expected)
 
 
 def test_read_options() -> None:

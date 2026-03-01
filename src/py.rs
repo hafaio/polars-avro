@@ -1,48 +1,53 @@
 //! pyo3 bindings
 
-use miniz_oxide::deflate::CompressionLevel;
+use super::{Error, ReadOptions, Reader, Writer, get_schema};
+use arrow_avro::compression::CompressionCodec;
+use polars::prelude::{PlSmallStr, Schema};
+use pyo3::exceptions::{PyException, PyIOError, PyIndexError, PyKeyError, PyValueError};
+use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
+use pyo3::{
+    Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python, create_exception, pyclass, pymethods,
+    pymodule,
+};
+use pyo3_polars::error::PyPolarsErr;
+use pyo3_polars::{PyDataFrame, PyDataType, PySchema};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::iter::{Chain, Fuse};
 use std::sync::Arc;
 
-use apache_avro::{
-    Bzip2Settings, Codec as AvroCodec, DeflateSettings, XzSettings, ZstandardSettings,
-};
-use polars::prelude::file::Writeable;
-use polars::prelude::{PlPathRef, PlSmallStr, Schema};
-use polars_io::cloud::CloudOptions;
-use pyo3::exceptions::{PyException, PyIOError, PyRuntimeError, PyValueError};
-use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
-use pyo3::{
-    Bound, Py, PyAny, PyErr, PyResult, Python, create_exception, pyclass, pyfunction, pymethods,
-    pymodule, wrap_pyfunction,
-};
-use pyo3_polars::error::PyPolarsErr;
-use pyo3_polars::{PyDataFrame, PySchema};
-
-use crate::{AvroIter, AvroScanner, Error, WriteOptions, sink_avro};
-
+#[derive(Debug)]
 enum ScanSource {
-    File(BufReader<File>),
-    Bytes(BufReader<PyReader>),
+    File(File),
+    Bytes(PyIO),
 }
 
 impl Read for ScanSource {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             ScanSource::File(reader) => reader.read(buf),
             ScanSource::Bytes(cursor) => cursor.read(buf),
         }
     }
 }
+
+impl Seek for ScanSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            ScanSource::File(reader) => reader.seek(pos),
+            ScanSource::Bytes(cursor) => cursor.seek(pos),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct BytesIter {
-    buffs: Arc<[Arc<Py<PyAny>>]>,
+    buffs: Arc<[(PyIO, u64)]>,
     idx: usize,
 }
 
 impl BytesIter {
-    fn new(buffs: Arc<[Arc<Py<PyAny>>]>) -> Self {
+    fn new(buffs: Arc<[(PyIO, u64)]>) -> Self {
         Self { buffs, idx: 0 }
     }
 }
@@ -51,13 +56,18 @@ impl Iterator for BytesIter {
     type Item = Result<ScanSource, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.buffs.get(self.idx).map(|buff| {
+        self.buffs.get(self.idx).map(|(buff, pos)| {
             self.idx += 1;
-            Ok(ScanSource::Bytes(BufReader::new(PyReader(buff.clone()))))
+            // reset the buffer
+            // NOTE there's a race condition here if two things are iterating
+            // over this at the same time, but that _shouldn't_ happen
+            buff.py_seek(SeekFrom::Start(*pos))?;
+            Ok(ScanSource::Bytes(buff.clone()))
         })
     }
 }
 
+#[derive(Debug)]
 struct PathIter {
     paths: Arc<[String]>,
     idx: usize,
@@ -76,65 +86,32 @@ impl Iterator for PathIter {
         self.paths.get(self.idx).map(|path| {
             self.idx += 1;
             match File::open(path) {
-                Ok(file) => Ok(ScanSource::File(BufReader::new(file))),
+                Ok(file) => Ok(ScanSource::File(file)),
                 Err(err) => Err(Error::IO(err, path.clone())),
             }
         })
     }
 }
 
-type SourceIter = Chain<BytesIter, PathIter>;
+type SourceIter = Chain<PathIter, BytesIter>;
 
 #[pyclass]
-pub struct PyAvroIter(Fuse<AvroIter<ScanSource, SourceIter>>);
+#[derive(Debug)]
+pub struct PyAvroIter(Fuse<Reader<ScanSource, SourceIter, Vec<String>>>);
 
 #[pymethods]
 impl PyAvroIter {
     fn next(&mut self) -> PyResult<Option<PyDataFrame>> {
-        let PyAvroIter(inner) = self;
-        Ok(inner.next().transpose().map(|op| op.map(PyDataFrame))?)
+        Ok(self.0.next().transpose().map(|op| op.map(PyDataFrame))?)
     }
 }
 
-struct PyReader(Arc<Py<PyAny>>);
+#[derive(Debug, Clone)]
+struct PyIO(Arc<Py<PyAny>>);
 
-impl Read for PyReader {
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        Python::attach(|py| {
-            let res = self.0.bind(py).call_method1("read", (buf.len(),))?;
-            let bytes = res.downcast_into::<PyBytes>()?;
-            let raw = bytes.as_bytes();
-            buf.write_all(raw)?;
-            Ok(raw.len())
-        })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
-    }
-}
-
-struct PyWriter(Py<PyAny>);
-
-impl Write for PyWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Python::attach(|py| {
-            // FIXME necessary?
-            // let inp = PyBytes::new(py, buf);
-            let res = self.0.bind(py).call_method1("write", (buf,))?;
-            res.extract()
-        })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Python::attach(|py| {
-            self.0.bind(py).call_method0("flush")?;
-            Ok(())
-        })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
-    }
-}
-
-impl Seek for PyWriter {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+impl PyIO {
+    // readonly seek
+    fn py_seek(&self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
             SeekFrom::Start(pos) => Python::attach(|py| {
                 let writer = self.0.bind(py);
@@ -163,31 +140,64 @@ impl Seek for PyWriter {
     }
 }
 
+impl Read for PyIO {
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        Python::attach(|py| {
+            let res = self.0.bind(py).call_method1("read", (buf.len(),))?;
+            let bytes = res.cast_into::<PyBytes>()?;
+            let raw = bytes.as_bytes();
+            buf.write_all(raw)?;
+            Ok(raw.len())
+        })
+        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+    }
+}
+
+impl Write for PyIO {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Python::attach(|py| {
+            let res = self.0.bind(py).call_method1("write", (buf,))?;
+            res.extract()
+        })
+        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Python::attach(|py| {
+            self.0.bind(py).call_method0("flush")?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+    }
+}
+
+impl Seek for PyIO {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.py_seek(pos)
+    }
+}
+
 #[pyclass]
+#[derive(Debug, Clone)]
 pub struct AvroSource {
     paths: Arc<[String]>,
-    buffs: Arc<[Arc<Py<PyAny>>]>,
-    single_col_name: Option<PlSmallStr>,
+    buffs: Arc<[(PyIO, u64)]>,
     schema: Option<Arc<Schema>>,
-    last_scanner: Option<AvroScanner<ScanSource, SourceIter>>,
 }
 
 impl AvroSource {
-    /// If we created a scanner to get the schema, then take it, otherwise create a new one.
-    fn take_scanner(&mut self) -> Result<AvroScanner<ScanSource, SourceIter>, Error> {
-        if let Some(scanner) = self.last_scanner.take() {
-            Ok(scanner)
+    fn get_sources(&self) -> SourceIter {
+        PathIter::new(self.paths.clone()).chain(BytesIter::new(self.buffs.clone()))
+    }
+
+    fn get_schema(&mut self) -> Result<Arc<Schema>, Error> {
+        if let Some(schema) = &self.schema {
+            Ok(schema.clone())
         } else {
-            // create a new scanner from the sources
-            let scanner = AvroScanner::try_new(
-                BytesIter::new(self.buffs.clone()).chain(PathIter::new(self.paths.clone())),
-                self.single_col_name.clone(),
-            )?;
-            // ensure we store the schema
-            if self.schema.is_none() {
-                self.schema = Some(scanner.schema());
-            }
-            Ok(scanner)
+            let first = self.get_sources().next().ok_or(Error::EmptySources)??;
+            let schema = Arc::new(get_schema(BufReader::new(first))?);
+            self.schema = Some(schema.clone());
+            Ok(schema)
         }
     }
 }
@@ -195,47 +205,58 @@ impl AvroSource {
 #[pymethods]
 impl AvroSource {
     #[new]
-    #[pyo3(signature = (paths, buffs, single_col_name))]
-    fn new(paths: Vec<String>, buffs: Vec<Py<PyAny>>, single_col_name: Option<String>) -> Self {
-        Self {
+    #[pyo3(signature = (paths, buffs))]
+    fn new(paths: Vec<String>, buffs: Vec<Py<PyAny>>) -> Result<Self, PyErr> {
+        Ok(Self {
             paths: paths.into(),
-            buffs: buffs.into_iter().map(Arc::new).collect(),
-            single_col_name: single_col_name.map(PlSmallStr::from),
+            buffs: buffs
+                .into_iter()
+                .map(|obj| {
+                    let mut buff = PyIO(Arc::new(obj));
+                    buff.stream_position().map(move |pos| (buff, pos))
+                })
+                .collect::<Result<_, _>>()?,
             schema: None,
-            last_scanner: None,
-        }
+        })
     }
 
+    #[pyo3(signature = ())]
     fn schema(&mut self) -> PyResult<PySchema> {
-        Ok(PySchema(match &mut self.schema {
-            Some(schema) => schema.clone(),
-            loc @ None => {
-                let new_schema = if let Some(scanner) = &self.last_scanner {
-                    scanner.schema()
-                } else {
-                    let new_scanner = AvroScanner::try_new(
-                        BytesIter::new(self.buffs.clone()).chain(PathIter::new(self.paths.clone())),
-                        self.single_col_name.clone(),
-                    )?;
-                    let schema = new_scanner.schema();
-                    self.last_scanner = Some(new_scanner);
-                    schema
-                };
-                loc.insert(new_schema).clone()
-            }
-        }))
+        Ok(PySchema(self.get_schema()?.clone()))
     }
 
-    #[pyo3(signature = (batch_size, with_columns))]
+    #[pyo3(signature = (strict, utf8_view, batch_size, with_columns))]
     #[allow(clippy::needless_pass_by_value)]
     fn batch_iter(
         &mut self,
+        strict: bool,
+        utf8_view: bool,
         batch_size: usize,
         with_columns: Option<Vec<String>>,
     ) -> PyResult<PyAvroIter> {
-        let scanner = self.take_scanner()?;
-        let iter = scanner.try_into_iter(batch_size, with_columns.as_deref())?;
-        Ok(PyAvroIter(iter))
+        let projection = if with_columns.is_none() && strict {
+            let base_schema = self.get_schema()?;
+            Some(
+                base_schema
+                    .iter_names()
+                    .map(PlSmallStr::to_string)
+                    .collect(),
+            )
+        } else {
+            with_columns
+        };
+        Ok(PyAvroIter(
+            Reader::try_new(
+                self.get_sources(),
+                ReadOptions {
+                    strict,
+                    utf8_view,
+                    batch_size,
+                    projection,
+                },
+            )?
+            .fuse(),
+        ))
     }
 }
 
@@ -250,131 +271,108 @@ enum Codec {
     Zstandard,
 }
 
-fn create_codec(codec: Codec, compression_level: Option<u8>) -> AvroCodec {
-    match codec {
-        Codec::Null => AvroCodec::Null,
-        Codec::Deflate => AvroCodec::Deflate(if let Some(compression_level) = compression_level {
-            DeflateSettings::new(match compression_level {
-                0 => CompressionLevel::NoCompression,
-                1 => CompressionLevel::BestSpeed,
-                9 => CompressionLevel::BestCompression,
-                10 => CompressionLevel::UberCompression,
-                6 => CompressionLevel::DefaultLevel,
-                _ => CompressionLevel::DefaultCompression,
-            })
-        } else {
-            DeflateSettings::default()
-        }),
-        Codec::Snappy => AvroCodec::Snappy,
-        Codec::Bzip2 => AvroCodec::Bzip2(if let Some(compression_level) = compression_level {
-            Bzip2Settings { compression_level }
-        } else {
-            Bzip2Settings::default()
-        }),
-        Codec::Xz => AvroCodec::Xz(if let Some(compression_level) = compression_level {
-            XzSettings { compression_level }
-        } else {
-            XzSettings::default()
-        }),
-        Codec::Zstandard => {
-            AvroCodec::Zstandard(if let Some(compression_level) = compression_level {
-                ZstandardSettings { compression_level }
-            } else {
-                ZstandardSettings::default()
-            })
+impl From<Codec> for Option<CompressionCodec> {
+    fn from(obj: Codec) -> Self {
+        match obj {
+            Codec::Null => None,
+            Codec::Deflate => Some(CompressionCodec::Deflate),
+            Codec::Snappy => Some(CompressionCodec::Snappy),
+            Codec::Bzip2 => Some(CompressionCodec::Bzip2),
+            Codec::Xz => Some(CompressionCodec::Xz),
+            Codec::Zstandard => Some(CompressionCodec::ZStandard),
         }
     }
 }
 
-// TODO Add credentials when stabilized
-#[pyfunction]
-#[pyo3(signature = (frames, dest, codec, promote_ints, promote_array, truncate_time, compression_level, cloud_options))]
-#[allow(clippy::too_many_arguments)]
-fn write_avro_file(
-    frames: Vec<PyDataFrame>,
-    dest: &str,
-    codec: Codec,
-    promote_ints: bool,
-    promote_array: bool,
-    truncate_time: bool,
-    compression_level: Option<u8>,
-    cloud_options: Option<Vec<(String, String)>>,
-) -> PyResult<()> {
-    let dest = PlPathRef::new(dest);
-    let scheme = dest.as_cloud_path().map(|cp| cp.scheme());
-    let options =
-        CloudOptions::from_untyped_config(scheme.as_ref(), cloud_options.unwrap_or_default())
-            .map_err(PyPolarsErr::from)?;
-    let mut write = Writeable::try_new(dest, Some(&options)).map_err(PyPolarsErr::from)?;
-    sink_avro(
-        frames.into_iter().map(|PyDataFrame(frame)| frame),
-        &mut *write,
-        WriteOptions {
-            codec: create_codec(codec, compression_level),
-            promote_ints,
-            promote_array,
-            truncate_time,
-        },
-    )?;
-    Ok(())
+struct PySchemaRef(Vec<(String, PyDataType)>);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PySchemaRef {
+    type Error = PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        Ok(Self(Vec::<(String, PyDataType)>::extract(obj)?))
+    }
 }
 
-#[pyfunction]
-#[pyo3(signature = (frames, buff, codec, promote_ints, promote_array, truncate_time, compression_level))]
-#[allow(clippy::too_many_arguments)]
-fn write_avro_buff(
-    frames: Vec<PyDataFrame>,
-    buff: Py<PyAny>,
-    codec: Codec,
-    promote_ints: bool,
-    promote_array: bool,
-    truncate_time: bool,
-    compression_level: Option<u8>,
-) -> PyResult<()> {
-    let buff = BufWriter::new(PyWriter(buff));
-    sink_avro(
-        frames.into_iter().map(|PyDataFrame(frame)| frame),
-        buff,
-        WriteOptions {
-            codec: create_codec(codec, compression_level),
-            promote_ints,
-            promote_array,
-            truncate_time,
-        },
-    )?;
-    Ok(())
+impl From<PySchemaRef> for Schema {
+    fn from(obj: PySchemaRef) -> Self {
+        let mut schema = Schema::with_capacity(obj.0.len());
+        for (name, PyDataType(dtype)) in obj.0 {
+            schema.insert(name.into(), dtype);
+        }
+        schema
+    }
+}
+
+// TODO Add credentials when stabilized
+#[pyclass]
+pub struct AvroFileSink(Writer<BufWriter<File>>);
+
+#[pymethods]
+impl AvroFileSink {
+    #[new]
+    #[pyo3(signature = (path, fields, codec))]
+    fn new(path: &str, fields: PySchemaRef, codec: Codec) -> Result<Self, PyErr> {
+        Ok(Self(Writer::try_new(
+            BufWriter::new(File::create(path)?),
+            &fields.into(),
+            codec.into(),
+        )?))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (batch))]
+    fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
+        Ok(self.0.write(&batch.0)?)
+    }
+}
+
+#[pyclass]
+pub struct AvroBuffSink(Writer<BufWriter<PyIO>>);
+
+#[pymethods]
+impl AvroBuffSink {
+    #[new]
+    #[pyo3(signature = (buff, fields, codec))]
+    fn new(buff: Py<PyAny>, fields: PySchemaRef, codec: Codec) -> Result<Self, PyErr> {
+        Ok(Self(Writer::try_new(
+            BufWriter::new(PyIO(Arc::new(buff))),
+            &fields.into(),
+            codec.into(),
+        )?))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (batch))]
+    fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
+        Ok(self.0.write(&batch.0)?)
+    }
 }
 
 impl From<Error> for PyErr {
     fn from(value: Error) -> Self {
         match value {
             Error::Polars(err) => PyPolarsErr::from(err).into(),
+            Error::Arrow(err) => AvroError::new_err(err.to_string()),
             Error::Avro(err) => AvroError::new_err(err.to_string()),
             Error::EmptySources => EmptySources::new_err("must scan at least one source"),
-            Error::NonRecordSchema(schema) => {
-                AvroSpecError::new_err(format!("top level avro schema must be a record: {schema}",))
-            }
-            Error::UnsupportedAvroType(schema) => {
-                AvroSpecError::new_err(format!("unsupported type in read conversion: {schema}"))
+            Error::NonRecordSchema => {
+                AvroSpecError::new_err("top level avro schema must be a record")
             }
             Error::UnsupportedPolarsType(data_type) => {
                 AvroSpecError::new_err(format!("unsupported type in write conversion: {data_type}"))
             }
             Error::NullEnum => AvroSpecError::new_err("enum schema contained null fields"),
-            Error::MissingRefName(name) => {
-                AvroSpecError::new_err(format!("couldn't find referenced {name} in schema"))
+            Error::LargeHeader => {
+                AvroSpecError::new_err("header was too large to effectively parse")
             }
-            Error::NonMatchingSchemas => {
-                AvroSpecError::new_err("encountered non-identical schemas in same batch")
+            e @ Error::NonMatchingSchemas { .. } => AvroSpecError::new_err(format!("{e}")),
+            Error::ColumnNotFound(col) => {
+                PyKeyError::new_err(format!("Column \"{col}\" not found in schema"))
             }
-            Error::InvalidArrowType(data_type, arrow_data_type) => {
-                PyRuntimeError::new_err(format!(
-                    "encountered unhandled type conversion: {data_type} from {arrow_data_type:?}"
-                ))
+            Error::ColumnIndexOutOfBounds(ind) => {
+                PyIndexError::new_err(format!("Column index {ind} is out of bounds"))
             }
-            Error::InvalidAvroValue(value) => AvroSpecError::new_err(format!(
-                "tried to deserialize an avro value that doesn't match the spec: {value:?}"
-            )),
             Error::IO(err, path) => PyIOError::new_err(format!("I/O error: {path}: {err}")),
         }
     }
@@ -388,11 +386,11 @@ create_exception!(exceptions, AvroSpecError, PyValueError);
 #[pyo3(name = "_avro_rs")]
 fn polars_avro(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AvroSource>()?;
+    m.add_class::<AvroFileSink>()?;
+    m.add_class::<AvroBuffSink>()?;
     m.add_class::<Codec>()?;
     m.add("AvroError", py.get_type::<AvroError>())?;
     m.add("EmptySources", py.get_type::<EmptySources>())?;
     m.add("AvroSpecError", py.get_type::<AvroSpecError>())?;
-    m.add_function(wrap_pyfunction!(write_avro_file, m)?)?;
-    m.add_function(wrap_pyfunction!(write_avro_buff, m)?)?;
     Ok(())
 }

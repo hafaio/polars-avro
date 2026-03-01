@@ -1,80 +1,82 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable
+from functools import partial
 from os import path
 from pathlib import Path
 from typing import BinaryIO
 
-from polars import DataFrame
+from polars import DataFrame, Schema
 
-from ._avro_rs import Codec, write_avro_buff, write_avro_file
+from ._avro_rs import AvroBuffSink, AvroFileSink, Codec
+
+
+def create_writer(
+    schema: Schema,
+    *,
+    dest: str | Path | BinaryIO,
+    codec: Codec = Codec.Null,
+) -> AvroBuffSink | AvroFileSink:
+    fields = [*schema.items()]
+    match dest:
+        case str() | Path():
+            expanded = path.expanduser(path.expandvars(dest))
+            return AvroFileSink(expanded, fields, codec)
+        case _:
+            return AvroBuffSink(dest, fields, codec)
+
+
+class AvroWriter:
+    """Incrementally write DataFrames to an Avro file.
+
+    Some polars types (Int8, Int16, UInt8, UInt16, UInt32, UInt64, Time,
+    Categorical, Enum) must be cast before writing — see the README for
+    workarounds.
+    """
+
+    def __init__(
+        self,
+        dest: str | Path | BinaryIO,
+        *,
+        schema: Schema | None = None,
+        codec: Codec = Codec.Null,
+    ) -> None:
+        self._create: Callable[[Schema], AvroBuffSink | AvroFileSink] = partial(
+            create_writer,
+            dest=dest,
+            codec=codec,
+        )
+        self._sink = None if schema is None else self._create(schema)
+
+    def write(self, batch: DataFrame) -> None:
+        if self._sink is None:
+            self._sink = self._create(batch.schema)
+        self._sink.write(batch)
 
 
 def write_avro(  # noqa: PLR0913
-    frame: DataFrame,
+    batches: DataFrame | Iterable[DataFrame],
     dest: str | Path | BinaryIO,
     *,
-    batch_size: int | None = None,
+    schema: Schema | None = None,
     codec: Codec = Codec.Null,
-    promote_ints: bool = True,
-    promote_array: bool = True,
-    truncate_time: bool = False,
-    compression_level: int | None = None,
-    storage_options: Mapping[str, str] | None = None,
 ) -> None:
-    """Write a DataFrame to an Avro file.
+    """Write a DataFrame or iterable of DataFrames to an Avro file.
+
+    Some polars types (Int8, Int16, UInt8, UInt16, UInt32, UInt64, Time,
+    Categorical, Enum) must be cast before writing — see the README for
+    workarounds.
 
     Parameters
     ----------
-    frame : The DataFrame to write.
-    dest : Where to write the dataframe
-    codec : The codec to use for compression, or Null for uncompressed.
-    promote_ints : Whether to promote integer columns to a larger type in order
-        to support writing them.
-    promote_array : Whether to promote array columns to lists in order to
-        support writing them to avro.
-    truncate_time : Whether to truncate time columns so they can be written to
-        avro as avro doesn't support time with nanosecond precision.
-    retries : The number of times to retry cloud operations.
-    credential_provider : The credential provider to use for cloud operations.
-        Defaults to "auto" which uses the default credential provider.
-    storage_options : Additional options for cloud operations.
+    batches : A DataFrame or iterable of DataFrames to write.
+    dest : The file path or writable binary buffer to write to.
+    schema : The schema to use. If None, inferred from the first batch.
+    codec : The compression codec to use.
     """
-    # normalize dest
-    # normalize cloud options
-
-    # chunk array if batchsize specified
-    if batch_size is None:
-        frames = [frame]
+    writer = AvroWriter(dest, schema=schema, codec=codec)
+    if isinstance(batches, DataFrame):
+        writer.write(batches)
     else:
-        frames = [
-            frame[i : i + batch_size].rechunk()
-            for i in range(0, len(frame), batch_size)
-        ]
-
-    match dest:
-        case str() | Path():
-            expanded = path.expandvars(dest)
-            cloud_options = (
-                None if storage_options is None else [*storage_options.items()]
-            )
-            write_avro_file(
-                frames,
-                expanded,
-                codec,
-                promote_ints,
-                promote_array,
-                truncate_time,
-                compression_level,
-                cloud_options,
-            )
-        case _:
-            write_avro_buff(
-                frames,
-                dest,
-                codec,
-                promote_ints,
-                promote_array,
-                truncate_time,
-                compression_level,
-            )
+        for batch in batches:
+            writer.write(batch)

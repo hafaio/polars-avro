@@ -4,24 +4,11 @@
 [![pypi](https://img.shields.io/pypi/v/polars-avro)](https://pypi.org/project/polars-avro/)
 [![docs](https://img.shields.io/badge/api-docs-blue)](https://hafaio.github.io/polars-avro)
 
-A polars io plugin for reading and writing avro files.
-
-Polars is deprecating support for reading and writing avro files, and this
-plugin fills in support. Currently it's about 7x slower at reading avro files
-and up to 20x slower at writing files.
-
-The reason it's slower is because this uses the apache rust library, which is
-fully compliant, but does a lot of unnecessary memory allocation and object
-creation that the polars implementation avoids. However, this is likely not a
-bottleneck, so the benefits of the standard implementation seem to outweigh the
-added computation.
-
-In exchange for speed you get:
-
-1. future proof - this won't get deprecated
-2. robust support - the current polars avro implementation has bugs with non-contiguous data frames
-3. better coverage - this supports reading map types as lists
-4. scan support - this can scan and push down predicates by chunk
+A polars io plugin for reading and writing
+[Apache Avro](https://avro.apache.org/) files, built on
+[arrow-avro](https://crates.io/crates/arrow-avro). It provides scan support
+with predicate pushdown, map type reading, and continued avro support as polars
+deprecates its built-in implementation.
 
 ## Python Usage
 
@@ -30,61 +17,120 @@ from polars_avro import scan_avro, read_avro, write_avro
 
 lazy = scan_avro(path)
 frame = read_avro(path)
-write_avro(frame, path)
+write_avro([frame], path)
 ```
 
 ## Rust Usage
 
-There are two main objects exported in rust: `AvroScanner` for creating an
-iterator of `DataFrames` from polars `ScanSources`, and `sink_avro` for writing
-an iterator of `DataFrame`s to a `Write`able.
+There are two main exports: [`Reader`] for iterating `DataFrame`s from avro
+sources, and [`Writer`] for writing `DataFrame`s to an avro file.
 
 ```rs
-use polars_avro::{AvroScanner, sink_avro, WriteOptions};
+use polars_avro::{Reader, Writer, ReadOptions};
 
-let scanner = AvroScanner::new_from_sources(
-    &ScanSources::Paths(...),
-    false, // expand globs
-    None,  // cloud options
-    None,  // name for single column avros
-).unwrap()
-
-sink_avro(
-    scanner.into_iter(
-        1024, // batch size
-        None, // columns to select
-    ).map(Result::unwrap),
-    ..., // impl Write
-    WriteOptions::default(),
+// read
+let reader = Reader::try_new(
+    [File::open("data.avro")],
+    ReadOptions::basic(),
 ).unwrap();
+for batch in reader {
+    let frame = batch.unwrap();
+}
+
+// write
+let mut writer = Writer::try_new(file, frame.schema(), None).unwrap();
+writer.write(&frame).unwrap();
 ```
 
-> ℹ️ Avro supports writing with a file compression schemes. In
-> rust these features need to be enabled manually, e.g. `apache-avro/bzip` to
-> enable bzip2 compression. Decompression is handled automatically.
+> ℹ️ Avro supports writing with file compression schemes. In rust these need
+> to be enabled via feature flags: `deflate`, `snappy`, `bzip2`, `xz`, `zstd`.
+> Decompression is handled automatically.
 
 ## Idiosyncrasies
 
 Avro and Arrow don't align fully, and polars only supports a subset of arrow.
-This library tries to allow you to serialize to avro and deserialize from avro.
-Trying to do both means that many types will change at each pass due to the way
-serde works.
+Some types require casting before writing, and some avro types map to different
+polars types than you might expect when reading.
 
-1. Avro only supports time with at most microsecond resolution, polars only
-   supports time with nanosecond resolution, so writing times values truncates
-   them. You must explicitly allow this behavior.
-2. Avro fixed types don't support storing null values in the individual bytes so
-   while a fixed type can be read into a u8 array, it must be serialized back as
-   a list of i32s. This may be addressed with polars support for arrow
-   fixedlengthbinary, but that seems unlikely.
+### Writing
+
+The following polars types **error** when writing and must be cast first:
+
+| Polars Type   | Cast To                    |
+| ------------- | -------------------------- |
+| `Int8`        | `Int32`                    |
+| `Int16`       | `Int32`                    |
+| `UInt8`       | `Int32`                    |
+| `UInt16`      | `Int32`                    |
+| `UInt32`      | `Int64`                    |
+| `UInt64`      | `Int64` (lossy for > 2⁶³)  |
+| `Time`        | `Int64`                    |
+| `Categorical` | `Int32` or `String`        |
+| `Enum`        | `Int32` or `String`        |
+
+Compression is supported via feature flags: `deflate`, `snappy`, `bzip2`, `xz`,
+`zstd`.
+
+### Reading
+
+**`utf8_view` behavior** — the `utf8_view` option (default `false`) changes how
+certain types are read:
+
+| Type             | `utf8_view=false` (default) | `utf8_view=true`               |
+| ---------------- | --------------------------- | ------------------------------ |
+| UUID             | binary (16 bytes)           | formatted string               |
+| nullable strings | preserves nulls             | replaces null with `""` (lossy)|
+
+Since polars tends to work with string views internally, `utf8_view=true` is
+likely faster if you don't mind losing null string distinctions.
+
+**Type mappings of note:**
+
+| Avro Type                          | Polars Type                                   |
+| ---------------------------------- | --------------------------------------------- |
+| Enum                               | Categorical (not Enum)                        |
+| Map                                | List of Struct {key, value}                   |
+| BigDecimal                         | Binary                                        |
+| Duration                           | unsupported (errors)                          |
+| Date                               | Date (days since epoch)                       |
+| TimeMillis, TimeMicros             | Time (nanoseconds)                            |
+| TimestampMillis/Micros/Nanos       | Datetime with matching precision and UTC tz   |
+| LocalTimestampMillis/Micros/Nanos  | Datetime with matching precision and no tz    |
+
+**Constraints:** the root avro schema must be a Record, and all files in a
+multi-file read must share the same schema.
 
 ## Benchmarks
 
-| Library           |         Read Python |        Write Python |            Read Rust |           Write Rust |
-| ----------------- | ------------------: | ------------------: | -------------------: | -------------------: |
-| `polars`          |   6.0319 ms ( 1.00) |   3.0663 ms ( 1.00) |  41,393.76 ns (1.00) |  42,046.06 ns (1.00) |
-| `polars-avro`     |  39.9563 ms ( 6.62) |  67.9542 ms (22.16) | 248,206.20 ns (6.00) | 395,947.65 ns (9.42) |
-| `polars-fastavro` | 179.0461 ms (29.68) | 246.3771 ms (80.35) |                    - |                    - |
+Python reports median (file reads, in-memory writes). Rust reports mean.
+`native` = polars built-in avro. Ratio relative to native; **bold** = fastest.
+Complex rows use nested/struct types.
+
+| Benchmark                      |              native |         polars-avro |        jetliner |
+| ------------------------------ | ------------------: | ------------------: | --------------: |
+| python read 1K × 2             |   **64 µs** (1.00x) |       99 µs (1.54x) |  180 µs (2.79x) |
+| python read 64K × 2            |      2.7 ms (1.00x) |  **2.1 ms** (0.78x) |  2.8 ms (1.04x) |
+| python read 1K × 8             |  **183 µs** (1.00x) |      242 µs (1.32x) |  337 µs (1.84x) |
+| python read 1M × 8             |      159 ms (1.00x) |  **114 ms** (0.72x) |  145 ms (0.91x) |
+| python read 1M × 128           |       2.6 s (1.00x) |   **1.8 s** (0.69x) |   2.8 s (1.09x) |
+| python read complex 1K × 8     |                   — |          **449 µs** |          592 µs |
+| python read complex 1M × 8     |                   — |          **181 ms** |          260 ms |
+| python read proj 1M × 128 → 8  |       1.6 s (1.00x) |   **1.2 s** (0.75x) |   1.2 s (0.77x) |
+| python read proj 1K × 8 → 2    |  **133 µs** (1.00x) |      297 µs (2.24x) |  264 µs (1.99x) |
+| python write 1K × 2            |       42 µs (1.00x) |   **30 µs** (0.72x) |               — |
+| python write 64K × 2           |      1.5 ms (1.00x) |  **1.1 ms** (0.71x) |               — |
+| python write 1K × 8            |      143 µs (1.00x) |  **114 µs** (0.80x) |               — |
+| python write 1M × 8            |   **87 ms** (1.00x) |       93 ms (1.07x) |               — |
+| python write 1M × 128          |   **1.5 s** (1.00x) |       2.2 s (1.48x) |               — |
+| rust read 1K × 2               |       42 µs (1.00x) |   **34 µs** (0.80x) |               — |
+| rust read 1M × 128             |       2.8 s (1.00x) |   **2.0 s** (0.69x) |               — |
+| rust read proj 1M × 128 → 8    |       1.3 s (1.00x) |   **1.2 s** (0.87x) |               — |
+| rust read proj 1K × 8 → 2      |  **109 µs** (1.00x) |      116 µs (1.06x) |               — |
+| rust write 1K × 2              |       42 µs (1.00x) |   **22 µs** (0.53x) |               — |
+| rust write 64K × 2             |      1.5 ms (1.00x) |  **1.0 ms** (0.67x) |               — |
+| rust write 1K × 8              |      135 µs (1.00x) |   **93 µs** (0.69x) |               — |
+| rust write 1M × 8              |       97 ms (1.00x) |   **89 ms** (0.92x) |               — |
+| rust write 1M × 128            |       1.6 s (1.00x) |   **1.4 s** (0.88x) |               — |
 
 ## Development
 
@@ -94,23 +140,13 @@ Standard `cargo` commands will build and test the rust library.
 
 ### Python
 
-The python library is built with uv and maturin. Run the following to compile
-rust for use by python:
-
-For local rust development, run
-
-```sh
-uv run maturin develop -m Cargo.toml
-```
-
-to build a local copy of the rust interface. Add `-r` if you want to trust the
-benchmark results.
+The python library is built with uv and maturin. The rust components should build once, ance otherwise allow usage and testing.
 
 ### Testing
 
 ```sh
 cargo fmt --check
-cargo clippy --all-features
+cargo clippy --all-features --tests
 cargo test
 uv run ruff format --check
 uv run ruff check
@@ -120,12 +156,12 @@ uv run pytest
 
 ### Benchmarking
 
+Python benchmarks are disabled by default. To run them:
+
 ```sh
 cargo +nightly bench
-uv run pytest
+uv run pytest --benchmark-only
 ```
-
-> ℹ️ For python benchmarks, make sure you've compiled in release mode: `uv run maturin develop -m Cargo.toml -r`
 
 ### Releasing
 
@@ -136,3 +172,9 @@ uv run maturin build -r -o dist --target aarch64-apple-darwin
 uv run maturin build -r -o dist --target aarch64-unknown-linux-gnu --zig
 uv publish --username __token__
 ```
+
+### To Do
+
+- [ ] reimplement single column reader?
+- [ ] reimplement better workarounds for types that don't exist, e.g. serialize polars cat/enum to arrow enum and vice versa
+- [ ] aws / parity with polars remote storage reading

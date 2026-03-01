@@ -7,19 +7,25 @@ edition = "2024"
 crate-type = ["cdylib", "lib"]
 
 [features]
+deflate = ["arrow-avro/deflate"]
+snappy = ["arrow-avro/snappy", "apache-avro/snappy"]
+bzip2 = ["arrow-avro/bzip2", "apache-avro/bzip"]
+xz = ["arrow-avro/xz", "apache-avro/xz"]
+zstd = ["arrow-avro/zstd", "apache-avro/zstandard"]
 pyo3 = [
     "dep:pyo3",
     "dep:pyo3-polars",
     "dep:polars-python",
     "polars-io/python",
-    "apache-avro/bzip",
-    "apache-avro/snappy",
-    "apache-avro/xz",
-    "apache-avro/zstandard",
+    "deflate",
+    "snappy",
+    "bzip2",
+    "xz",
+    "zstd",
 ]
 
 [dependencies]
-polars = { version = "0.52.0", default-features = false, features = [
+polars = { version = "0.53", default-features = false, features = [
     "dtype-array",
     "dtype-categorical",
     "dtype-date",
@@ -34,22 +40,26 @@ polars = { version = "0.52.0", default-features = false, features = [
     "lazy",
     "timezones",
 ] }
-apache-avro = "0.21.0"
-polars-arrow = "0.52.0"
-polars-io = { version = "0.52.0", features = ["file_cache"] }
-polars-plan = { version = "0.52.0", features = ["cloud"] }
-polars-python = { version = "0.52.0", optional = true }
-polars-utils = "0.52.0"
-pyo3 = { version = "0.26.0", optional = true }
-pyo3-polars = { version = "0.25.0", features = [
+arrow = { version = "57.0", default-features = false, features = ["ffi"] }
+arrow-avro = { version = "57.0", default-features = false }
+serde_json = "1.0"
+polars-arrow = "0.53"
+polars-io = { version = "0.53", features = ["file_cache"] }
+polars-plan = { version = "0.53", features = ["cloud"] }
+polars-python = { version = "0.53", optional = true }
+polars-utils = "0.53"
+pyo3 = { version = "0.27", optional = true }
+pyo3-polars = { version = "0.26", features = [
     "lazy",
     "dtype-categorical",
     "dtype-struct",
     "dtype-array",
 ], optional = true }
-miniz_oxide = "0.8.9"
+apache-avro = "0.21.0"
 
 [dev-dependencies]
+bigdecimal = "0.4.9"
 chrono = "0.4.40"
-polars = { version = "0.52.0", default-features = false, features = ["fmt"] }
-polars-io = { version = "0.52.0", features = ["file_cache", "avro"] }
+uuid = "1.21"
+polars = { version = "0.53", default-features = false, features = ["fmt"] }
+polars-io = { version = "0.53", features = ["file_cache", "avro"] }
