@@ -1,680 +1,620 @@
 //! Rust scan implementation
 
+use super::Error;
+use super::Projection;
+use super::ffi;
+use apache_avro::Reader as AvroReader;
+use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
+use arrow_avro::reader::{Reader as ArrowAvroReader, ReaderBuilder};
+use arrow_avro::schema::AvroSchema;
+use polars::frame::DataFrame;
 use std::convert::Infallible;
-use std::io::Read;
-use std::iter::{Fuse, FusedIterator};
+use std::io::{BufReader, Read, Seek};
+use std::iter::FusedIterator;
 use std::sync::Arc;
 
-use crate::des::new_value_builder;
+/// Configuration options for the avro reader
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOptions<P = Infallible> {
+    /// If we should use strict parsing. Incurs a performance hit.
+    pub strict: bool,
+    /// If strings should be read in as views instead of character arrays.
+    ///
+    /// This affects UUID and nullable string handling — see the README for details.
+    /// Since polars tends to work with string views internally, enabling this is
+    /// likely faster if you don't mind losing null string distinctions.
+    pub utf8_view: bool,
+    /// The batch size for reading
+    pub batch_size: usize,
+    /// The columns to select
+    pub projection: Option<P>,
+}
 
-use super::{Error, des};
-use apache_avro::Reader;
-use apache_avro::types::Value;
-use polars::error::PolarsError;
-use polars::frame::DataFrame;
-use polars::prelude::{Column, PlSmallStr, Schema as PlSchema};
-use polars::series::Series;
+/// Read options without projection
+pub type FullReadOptions = ReadOptions<Infallible>;
 
-/// An abstract scanner that can be converted into an iterator over `DataFrame`s
-pub struct AvroScanner<R, I> {
-    reader: Reader<'static, R>,
+impl<P> Default for ReadOptions<P> {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            utf8_view: false,
+            batch_size: 1024,
+            projection: None,
+        }
+    }
+}
+
+impl<P: Projection> ReadOptions<P> {
+    fn create_reader<R: Read + Seek>(
+        &self,
+        reader: R,
+    ) -> Result<ArrowAvroReader<BufReader<R>>, Error> {
+        let mut builder = ReaderBuilder::new()
+            .with_utf8_view(self.utf8_view)
+            .with_strict_mode(self.strict)
+            .with_batch_size(self.batch_size);
+        let mut buf_reader = BufReader::new(reader);
+        if let Some(proj) = &self.projection {
+            // To do a projection we need to supply a schema, but arrow-avro
+            // doesn't keep the metadata necessary for ensuing a match
+            let orig = buf_reader.stream_position()?;
+            let projected = {
+                let reader = AvroReader::new(&mut buf_reader)?;
+                proj.project(reader.writer_schema())?
+            };
+            // we use seek_relative to avoid flishing the buffer
+            let cur = buf_reader.stream_position()?;
+            let seek = orig.checked_signed_diff(cur).ok_or(Error::LargeHeader)?;
+            buf_reader.seek_relative(seek)?;
+            builder = builder.with_reader_schema(AvroSchema::new(projected.canonical_form()));
+        }
+        Ok(builder.build(buf_reader)?)
+    }
+}
+
+/// An iterator that yields [`DataFrame`]s from one or more avro sources.
+///
+/// All sources must share the same schema; a [`Error::NonMatchingSchemas`]
+/// error is returned if they differ.
+#[derive(Debug)]
+pub struct Reader<R: Read, I, C> {
     sources: I,
-    schema: Arc<PlSchema>,
-    single_column_name: Option<PlSmallStr>,
+    source: ArrowAvroReader<BufReader<R>>,
+    options: ReadOptions<C>,
+    schema: Arc<Schema>,
 }
 
-impl From<Infallible> for Error {
-    fn from(value: Infallible) -> Self {
-        match value {}
-    }
-}
-
-pub struct InfallibleIter<I>(I);
-
-impl<I: Iterator> Iterator for InfallibleIter<I> {
-    type Item = Result<I::Item, Infallible>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(Result::Ok)
-    }
-}
-
-impl<I: ExactSizeIterator> ExactSizeIterator for InfallibleIter<I> {}
-impl<I: FusedIterator> FusedIterator for InfallibleIter<I> {}
-
-impl<R, I> AvroScanner<R, InfallibleIter<I>>
+impl<R, E, I, P> Reader<R, I, P>
 where
-    R: Read,
-    I: Iterator<Item = R>,
-{
-    /// Create a new scanner from `ScanSources`
-    ///
-    /// # Errors
-    ///
-    /// If the schema can't be converted into a polars schema.
-    pub fn new(
-        sources: impl IntoIterator<IntoIter = I>,
-        single_column_name: Option<PlSmallStr>,
-    ) -> Result<Self, Error> {
-        Self::try_new(InfallibleIter(sources.into_iter()), single_column_name)
-    }
-}
-
-impl<R, E, I> AvroScanner<R, I>
-where
-    R: Read,
+    R: Read + Seek,
     Error: From<E>,
     I: Iterator<Item = Result<R, E>>,
+    P: Projection,
 {
-    /// Create a new scanner from `ScanSources`
+    /// Create a new iterator from sources and a config
     ///
     /// # Errors
-    ///
-    /// If the schema can't be converted into a polars schema, or any errors from the readers.
+    /// If sources is empty, or is a problem creating a reader from the first
+    /// source
     pub fn try_new(
         sources: impl IntoIterator<IntoIter = I>,
-        single_column_name: Option<PlSmallStr>,
+        config: ReadOptions<P>,
     ) -> Result<Self, Error> {
         let mut sources = sources.into_iter();
-        let source = sources.next().ok_or(Error::EmptySources)??;
-        let reader = Reader::new(source)?;
-        let schema = Arc::new(des::try_from_schema(
-            reader.writer_schema(),
-            single_column_name.as_ref(),
-        )?);
-
+        let first = sources.next().ok_or(Error::EmptySources)??;
+        let source = config.create_reader(first)?;
+        let schema = source.schema();
         Ok(Self {
-            reader,
             sources,
+            source,
+            options: config,
             schema,
-            single_column_name,
         })
     }
 
-    /// Get the schema
-    pub fn schema(&self) -> Arc<PlSchema> {
-        self.schema.clone()
-    }
-
-    /// Convert the scanner into an actual iterator
-    pub fn into_iter(
-        self,
-        batch_size: usize,
-        with_columns: Option<Arc<[usize]>>,
-    ) -> Fuse<AvroIter<R, I>> {
-        AvroIter {
-            reader: self.reader,
-            sources: self.sources,
-            schema: self.schema,
-            single_column_name: self.single_column_name,
-            batch_size,
-            with_columns,
-        }
-        .fuse()
-    }
-
-    /// Convert the scanner into an actual iterator
-    ///
-    /// This uses string columns instead of indices
-    ///
-    /// # Errors
-    ///
-    /// If columns don't exist in the schema.
-    pub fn try_into_iter(
-        self,
-        batch_size: usize,
-        columns: Option<&[impl AsRef<str>]>,
-    ) -> Result<Fuse<AvroIter<R, I>>, Error> {
-        let with_columns = if let Some(columns) = columns {
-            let indexes = columns
-                .iter()
-                .map(|name| {
-                    self.schema
-                        .index_of(name.as_ref())
-                        .ok_or_else(|| PolarsError::ColumnNotFound(name.as_ref().to_owned().into()))
-                })
-                .collect::<Result<_, _>>()?;
-            Some(indexes)
-        } else {
-            None
-        };
-        Ok(AvroIter {
-            reader: self.reader,
-            sources: self.sources,
-            schema: self.schema,
-            single_column_name: self.single_column_name,
-            batch_size,
-            with_columns,
-        }
-        .fuse())
+    fn matched_schema(&self, batch: &RecordBatch) -> bool {
+        self.options.projection.is_some() || batch.schema() == self.schema
     }
 }
 
-/// An `Iterator` of `DataFrame` batches scanned from various sources
-pub struct AvroIter<R, I> {
-    reader: Reader<'static, R>,
-    sources: I,
-    schema: Arc<PlSchema>,
-    single_column_name: Option<PlSmallStr>,
-    batch_size: usize,
-    with_columns: Option<Arc<[usize]>>,
-}
-
-impl<R, E, I> AvroIter<R, I>
+impl<R, E, I, P> Iterator for Reader<R, I, P>
 where
-    R: Read,
+    R: Read + Seek,
     Error: From<E>,
     I: Iterator<Item = Result<R, E>>,
-{
-    fn read_columns(
-        &mut self,
-        with_columns: impl IntoIterator<Item = usize> + Clone,
-    ) -> Result<Vec<Column>, Error> {
-        // abstracts this where we also pass in inds, which is a cloneable usize iterator and can eeither be with_columns or 0..width()
-        let mut arrow_columns: Box<[_]> = with_columns
-            .clone()
-            .into_iter()
-            .map(|idx| {
-                // already checked that idx valid for schema
-                let (_, dtype) = self.schema.get_at_index(idx).unwrap();
-                new_value_builder(dtype, self.batch_size)
-            })
-            .collect();
-
-        for _ in 0..self.batch_size {
-            if let Some(rec) = self.reader.next() {
-                let val = rec?;
-                if let Value::Record(rec_val) = val {
-                    for (idx, col) in with_columns.clone().into_iter().zip(&mut arrow_columns) {
-                        let (_, val) = &rec_val[idx];
-                        col.try_push_value(val).map_err(Error::Polars)?;
-                    }
-                } else {
-                    // mapped to a single column
-                    let col = arrow_columns.first_mut().unwrap();
-                    col.try_push_value(&val).map_err(Error::Polars)?;
-                }
-            } else if let Some(source) = self.sources.next() {
-                self.reader = Reader::new(source?)?;
-                // NOTE we could be lazy and just check compatability, but
-                // we do want something like this equality, which will allow
-                // scanning multiple avro files as long as they have the
-                // same converted arrow schema, e.g. nullability or
-                // different integers.
-                let new_schema = des::try_from_schema(
-                    self.reader.writer_schema(),
-                    self.single_column_name.as_ref(),
-                )?;
-                if new_schema != *self.schema {
-                    return Err(Error::NonMatchingSchemas);
-                }
-            } else {
-                break;
-            }
-        }
-
-        with_columns
-            .into_iter()
-            .zip(&mut arrow_columns)
-            .map(|(idx, col)| {
-                let (name, dtype) = self.schema.get_at_index(idx).unwrap();
-                let ser = Series::from_arrow(name.clone(), col.as_box())?;
-                // NOTE we intentionally want to avoid any actual casting here
-                Ok(unsafe { ser.cast_unchecked(dtype) }?.into())
-            })
-            .collect()
-    }
-
-    fn read_frame(&mut self) -> Result<DataFrame, Error> {
-        let columns = if let Some(with_columns) = &self.with_columns {
-            let cols = with_columns.clone();
-            self.read_columns(cols.iter().copied())?
-        } else {
-            self.read_columns(0..self.schema.len())?
-        };
-
-        Ok(DataFrame::new(columns)?)
-    }
-}
-
-impl<R, E, I> Iterator for AvroIter<R, I>
-where
-    R: Read,
-    Error: From<E>,
-    I: Iterator<Item = Result<R, E>>,
+    P: Projection,
 {
     type Item = Result<DataFrame, Error>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self.read_frame() {
-            Ok(frame) if frame.is_empty() => None,
-            res => Some(res),
+        loop {
+            match self.source.next() {
+                Some(Ok(batch)) if self.matched_schema(&batch) => {
+                    return Some(ffi::recordbatch_to_dataframe(&batch));
+                }
+                Some(Ok(batch)) => {
+                    return Some(Err(Error::NonMatchingSchemas {
+                        expected: (*self.schema).clone(),
+                        actual: batch.schema(),
+                    }));
+                }
+                Some(Err(e)) => return Some(Err(e.into())),
+                None => match self.sources.next() {
+                    Some(Ok(source)) => {
+                        self.source = match self.options.create_reader(source) {
+                            Ok(reader) => reader,
+                            Err(e) => return Some(Err(e)),
+                        };
+                    }
+                    Some(Err(e)) => return Some(Err(e.into())),
+                    None => return None,
+                },
+            }
         }
     }
+}
+
+impl<R, E, I, P> FusedIterator for Reader<R, I, P>
+where
+    R: Read + Seek,
+    Error: From<E>,
+    I: Iterator<Item = Result<R, E>> + FusedIterator,
+    P: Projection,
+{
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::{Cursor, Read, Seek, SeekFrom};
-    use std::mem;
-    use std::sync::Arc;
-
-    use apache_avro::types::Value;
-    use apache_avro::{Schema, Writer};
-    use chrono::NaiveTime;
+    use super::{Error, FullReadOptions, Projection, ReadOptions, Reader};
+    use apache_avro::schema::ArraySchema;
+    use apache_avro::schema::EnumSchema;
+    use apache_avro::schema::MapSchema;
+    use apache_avro::schema::UnionSchema;
+    use apache_avro::schema::{DecimalSchema, FixedSchema, RecordField, RecordSchema, Schema};
+    use apache_avro::types::{Record, Value};
+    use apache_avro::{
+        AvroResult, Days, Decimal as AvroDecimal, Duration as AvroDuration, Millis, Months, Writer,
+    };
+    use bigdecimal::BigDecimal;
     use polars::df;
-    use polars::error::PolarsError;
     use polars::frame::DataFrame;
-    use polars::prelude::{self as pl, DataType, IntoLazy, Schema as PlSchema, UnionArgs};
+    use polars::prelude::PlSmallStr;
+    use polars::prelude::SortOptions;
+    use polars::prelude::StructChunked;
+    use polars::prelude::{
+        self as pl, Categories, DataType, IntoLazy, NamedFrom, Series, TimeUnit, TimeZone,
+        UnionArgs,
+    };
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::mem;
+    use uuid::Uuid;
 
-    use super::AvroScanner;
-    use crate::Error;
+    #[allow(clippy::unnecessary_wraps)]
+    fn ok<T>(val: T) -> Result<T, Infallible> {
+        Ok(val)
+    }
 
-    fn read_scan<R: Read, E>(
-        scanner: AvroScanner<R, impl Iterator<Item = Result<R, E>>>,
+    fn read_scan<R: Read + Seek, E>(
+        scanner: Reader<R, impl Iterator<Item = Result<R, E>>, impl Projection>,
     ) -> DataFrame
     where
         Error: From<E>,
     {
-        let frames: Vec<_> = scanner
-            .into_iter(1024, None)
-            .map(|part| part.unwrap().lazy())
-            .collect();
+        let frames: Vec<_> = scanner.map(|part| part.unwrap().lazy()).collect();
         pl::concat(frames, UnionArgs::default())
             .unwrap()
             .collect()
             .unwrap()
     }
 
-    impl From<std::io::Error> for Error {
-        fn from(err: std::io::Error) -> Self {
-            Error::Polars(PolarsError::IO {
-                error: Arc::new(err),
-                msg: None,
-            })
+    fn map_struct<'a, V>(
+        name: impl Into<PlSmallStr>,
+        keys: impl IntoIterator<Item = &'a str>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Series
+    where
+        Series: NamedFrom<Vec<&'a str>, [&'a str]> + NamedFrom<Vec<V>, [V]>,
+    {
+        let keys: Vec<&str> = keys.into_iter().collect();
+        let len = keys.len();
+        let values: Vec<V> = values.into_iter().collect();
+        let key_series = Series::new("key".into(), keys);
+        let value_series = Series::new("value".into(), values);
+        Series::from(
+            StructChunked::from_series(name.into(), len, [key_series, value_series].iter())
+                .unwrap(),
+        )
+    }
+
+    fn write_avro(
+        name: &str,
+        dtype: Schema,
+        vals: impl IntoIterator<Item = impl Into<Value>>,
+    ) -> AvroResult<Cursor<Vec<u8>>> {
+        let mut buff = Cursor::new(Vec::new());
+        let schema = Schema::Record(
+            RecordSchema::builder()
+                .name("base".into())
+                .fields(vec![
+                    RecordField::builder()
+                        .name(name.into())
+                        .schema(dtype)
+                        .build(),
+                ])
+                .lookup([(name.into(), 0)].into())
+                .build(),
+        );
+        let mut writer = Writer::new(&schema, &mut buff);
+        for val in vals {
+            let mut first = Record::new(&schema).unwrap();
+            first.put(name, val);
+            writer.append(first)?;
         }
+        writer.flush()?;
+        mem::drop(writer);
+        buff.set_position(0);
+        Ok(buff)
     }
 
     /// Test scan on a simple file
     #[test]
     fn test_scan() {
-        let scanner = AvroScanner::try_new([File::open("./resources/food.avro")], None).unwrap();
-        let frame = read_scan(scanner);
+        let batches = Reader::try_new(
+            [File::open("./resources/food.avro")],
+            FullReadOptions::default(),
+        )
+        .unwrap();
+        let frame = read_scan(batches);
         assert_eq!(frame.height(), 27);
         assert_eq!(frame.schema().len(), 4);
     }
 
-    /// Test reading uuid
+    /// Test scan on a simple file
     #[test]
-    fn test_uuid() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": {"type": "string", "name": "uuid", "logicalType": "uuid"}}]
-        }
-        "#,
+    fn test_reorder() {
+        let columns = ["sugars_g", "calories"];
+        let batches = Reader::try_new(
+            [File::open("./resources/food.avro")],
+            ReadOptions {
+                projection: Some(&columns[..]),
+                ..ReadOptions::default()
+            },
         )
         .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![(
-                "field".into(),
-                Value::String("3738b99e-f4ae-40de-bb3f-fd4aa9d9e9f7".into()),
-            )]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        read_scan(scanner);
+        let frame = read_scan(batches);
+        assert_eq!(frame.get_column_names(), columns);
     }
 
-    /// Test reading fixed
-    #[test]
-    fn test_fixed() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
+    macro_rules! test_read_type {
+        ($(#[$attr:meta])* $name:ident: $col:expr, $schema:expr, $val:expr, $expected:expr $(, $field:ident : $value:expr)* $(,)?) => {
+            $(#[$attr])*
+            #[test]
+            fn $name() {
+                let buff = write_avro($col, $schema, $val).unwrap();
+                let res = Reader::try_new([ok(buff)], ReadOptions { $($field: $value,)* ..FullReadOptions::default() }).unwrap();
+                let frame = read_scan(res);
+                let expected: Series = $expected;
+                let actual = frame.column($col).unwrap().as_series().unwrap();
+                assert_eq!(actual, &expected);
+            }
+        };
+    }
+
+    test_read_type!(test_bytes: "bytes", Schema::Bytes,
+        [&b"test"[..], &b"another"[..]],
+        Series::new("bytes".into(), [&b"test"[..], &b"another"[..]])
+    );
+
+    test_read_type!(test_enum: "enum",
+        Schema::Enum(
+            EnumSchema::builder()
+                .name("enum".into())
+                .symbols(vec!["a".into(), "b".into()])
+                .build(),
+        ),
+        ["a", "b", "a"],
+        Series::new("enum".into(), ["a", "b", "a"])
+            .cast(&DataType::from_categories(Categories::global()))
+            .unwrap()
+    );
+
+    test_read_type!(test_fixed: "fixed",
+        Schema::Fixed(FixedSchema::builder().name("fixed".into()).size(4).build()),
+        [Value::Fixed(4, vec![1, 2, 3, 4]), Value::Fixed(4, vec![5, 6, 7, 8])],
+        Series::new("fixed".into(), [&[1u8, 2, 3, 4][..], &[5, 6, 7, 8][..]])
+    );
+
+    test_read_type!(test_decimal: "decimal",
+        Schema::Decimal(DecimalSchema { precision: 10, scale: 2, inner: Box::new(Schema::Bytes) }),
+        [
+            Value::Decimal(AvroDecimal::from(vec![0x64u8])),
+            Value::Decimal(AvroDecimal::from(vec![0x00, 0xFA])),
+        ],
         {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": {"type": "fixed", "name": "fixed", "size": 4}}]
+            let frame = df!("decimal" => ["1.00", "2.50"]).unwrap()
+                .lazy()
+                .select([pl::col("decimal").strict_cast(DataType::Decimal(10, 2))])
+                .collect().unwrap();
+            frame.column("decimal").unwrap().as_materialized_series().clone()
         }
-        "#,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![(
-                "field".into(),
-                Value::Fixed(4, b"0123".into()),
-            )]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let result = read_scan(scanner);
-        let expected = df! {
-            "field" => [&b"0123"[..]]
-        }
-        .unwrap();
-        assert_eq!(result, expected);
-    }
+    );
 
-    /// Test time
-    #[test]
-    fn test_time() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [
-                {"name": "millis", "type": {"type": "int", "logicalType": "time-millis"}},
-                {"name": "micros", "type": {"type": "long", "logicalType": "time-micros"}}
-            ]
-        }
-        "#,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![
-                ("millis".into(), Value::TimeMillis(1)),
-                ("micros".into(), Value::TimeMicros(1)),
-            ]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let frame = read_scan(scanner);
-        let expected = df! {
-            "millis" => [
-                NaiveTime::from_hms_milli_opt(0, 0, 0, 1).unwrap(),
-            ],
-            "micros" => [
-                NaiveTime::from_hms_micro_opt(0, 0, 0, 1).unwrap(),
-            ],
-        }
-        .unwrap();
-        assert_eq!(frame, expected);
-    }
+    // big decimal are deserialized as binary
+    test_read_type!(test_big_decimal: "big_decimal", Schema::BigDecimal,
+        [
+            Value::BigDecimal(BigDecimal::from(12345u32)),
+            Value::BigDecimal(BigDecimal::from(67890u32)),
+        ],
+        Series::new("big_decimal".into(), [
+            &b"\x0409\x00"[..],
+            &b"\x06\x01\x092\x00"[..],
+        ])
+    );
 
-    /// Test failure on avros that aren't a top level record
-    #[test]
-    fn test_non_record_avro() {
-        let mut buff = Cursor::new(Vec::new());
-        let mut writer = Writer::new(&Schema::Boolean, &mut buff);
-        writer.append(true).unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let res = AvroScanner::new([buff], None);
-        assert!(matches!(res, Err(Error::NonRecordSchema(_))));
-    }
+    test_read_type!(test_uuid_arr: "uuid", Schema::Uuid,
+        [
+            Value::Uuid(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap()),
+            Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+        ],
+        Series::new("uuid".into(), [
+            &b"\x93m\xa0\x1f\x9a\xbdM\x9d\x80\xc7\x02\xaf\x85\xc8\"\xa8"[..],
+            &b"U\x0e\x84\x00\xe2\x9bA\xd4\xa7\x16DfUD\x00\x00"[..],
+        ]),
+        utf8_view: false
+    );
 
-    /// Test failure on avro union type
+    test_read_type!(test_uuid_view: "uuid", Schema::Uuid,
+        [
+            Value::Uuid(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap()),
+            Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+        ],
+        Series::new("uuid".into(), [
+            "936da01f-9abd-4d9d-80c7-02af85c822a8",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ]),
+        utf8_view: true
+    );
+
+    test_read_type!(test_null_string_arr: "uuid", Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
+        [
+            Some("string"),
+            None,
+        ],
+        Series::new("uuid".into(), [
+            Some("string"),
+            None,
+       ]),
+        utf8_view: false
+    );
+
+    test_read_type!(test_null_string_view: "uuid", Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
+        [
+            Some("string"),
+            None,
+        ],
+        Series::new("uuid".into(), [
+            "string",
+            "",
+        ]),
+        utf8_view: true
+    );
+
+    /// This needs to be separate so we can sort the keys of the result, since
+    /// we can't guarantee order
     #[test]
     fn test_map() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": {"type": "map", "values": "int"}}]
-        }
-        "#,
+        let buff = write_avro(
+            "map",
+            Schema::Map(MapSchema {
+                types: Box::new(Schema::Int),
+                attributes: BTreeMap::new(),
+            }),
+            [
+                HashMap::from([("a", 1), ("b", 2)]),
+                HashMap::from([("c", 3)]),
+            ],
         )
         .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![(
-                "field".into(),
-                Value::Map([("key".into(), Value::Int(1))].into()),
-            )]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let frame = read_scan(scanner);
-        let base = df! {
-            "key" => ["key"],
-            "value" => [1],
-        }
-        .unwrap();
-        let expected = base
+        let res = Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap();
+        let base = read_scan(res);
+        // need to sort all of the lists to account for unknown serialization
+        // order
+        let frame = base
             .lazy()
-            .select([
-                pl::concat_list([pl::as_struct(vec![pl::col("key"), pl::col("value")])]).unwrap(),
-            ])
+            .with_column(pl::col("map").list().sort(SortOptions::default()))
             .collect()
             .unwrap();
-        assert_eq!(frame, expected);
-    }
-
-    /// Test failure on avro union type
-    #[test]
-    fn test_union_avro() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": ["boolean", "int"]}]
-        }
-        "#,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![(
-                "field".into(),
-                Value::Union(0, Box::new(Value::Boolean(true))),
-            )]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let res = AvroScanner::new([buff], None);
-        assert!(matches!(res, Err(Error::UnsupportedAvroType(_))));
-    }
-
-    /// Test failure on union with only null member
-    #[test]
-    fn test_null_union_avro() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": ["null"]}]
-        }
-        "#,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![(
-                "field".into(),
-                Value::Union(0, Box::new(Value::Null)),
-            )]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let frame = read_scan(scanner);
-        assert_eq!(
-            **frame.schema(),
-            PlSchema::from_iter([("field".into(), DataType::Null)])
+        let expected = Series::new(
+            "map".into(),
+            [
+                map_struct("1", ["a", "b"], [1, 2]),
+                map_struct("2", ["c"], [3]),
+            ],
         );
+        let actual = frame.column("map").unwrap().as_series().unwrap();
+        assert_eq!(actual, &expected);
     }
 
-    /// Test failure on with_columns when column isn't present
+    test_read_type!(test_date: "date", Schema::Date,
+        [Value::Date(19000), Value::Date(19500)],
+        Series::new("date".into(), [19000i32, 19500])
+            .cast(&DataType::Date).unwrap()
+    );
+
+    test_read_type!(test_time_millis: "time_ms", Schema::TimeMillis,
+        [Value::TimeMillis(1000), Value::TimeMillis(2000)],
+        Series::new("time_ms".into(), [1_000_000_000i64, 2_000_000_000])
+            .cast(&DataType::Time).unwrap()
+    );
+
+    test_read_type!(test_time_micros: "time_us", Schema::TimeMicros,
+        [Value::TimeMicros(1_000_000), Value::TimeMicros(2_000_000)],
+        Series::new("time_us".into(), [1_000_000_000i64, 2_000_000_000])
+            .cast(&DataType::Time).unwrap()
+    );
+
+    test_read_type!(test_timestamp_millis: "ts_ms", Schema::TimestampMillis,
+        [Value::TimestampMillis(1_000_000), Value::TimestampMillis(2_000_000)],
+        Series::new("ts_ms".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Milliseconds, Some(TimeZone::UTC))).unwrap()
+    );
+
+    test_read_type!(test_timestamp_micros: "ts_us", Schema::TimestampMicros,
+        [Value::TimestampMicros(1_000_000), Value::TimestampMicros(2_000_000)],
+        Series::new("ts_us".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))).unwrap()
+    );
+
+    test_read_type!(test_timestamp_nanos: "ts_ns", Schema::TimestampNanos,
+        [Value::TimestampNanos(1_000_000), Value::TimestampNanos(2_000_000)],
+        Series::new("ts_ns".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Nanoseconds, Some(TimeZone::UTC))).unwrap()
+    );
+
+    test_read_type!(test_local_timestamp_millis: "local_ts_ms", Schema::LocalTimestampMillis,
+        [Value::LocalTimestampMillis(1_000_000), Value::LocalTimestampMillis(2_000_000)],
+        Series::new("local_ts_ms".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Milliseconds, None)).unwrap()
+    );
+
+    test_read_type!(test_local_timestamp_micros: "local_ts_us", Schema::LocalTimestampMicros,
+        [Value::LocalTimestampMicros(1_000_000), Value::LocalTimestampMicros(2_000_000)],
+        Series::new("local_ts_us".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None)).unwrap()
+    );
+
+    test_read_type!(test_local_timestamp_nanos: "local_ts_ns", Schema::LocalTimestampNanos,
+        [Value::LocalTimestampNanos(1_000_000), Value::LocalTimestampNanos(2_000_000)],
+        Series::new("local_ts_ns".into(), [1_000_000i64, 2_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).unwrap()
+    );
+
+    /// arrow-avro will not deserialize durations
     #[test]
-    fn test_missing_columns() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [{"name": "field", "type": "int"}]
-        }
-        "#,
+    fn test_duration_error() {
+        let buff = write_avro(
+            "duration",
+            Schema::Duration,
+            [Value::Duration(AvroDuration::new(
+                Months::new(1),
+                Days::new(2),
+                Millis::new(3),
+            ))],
         )
         .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![("field".into(), Value::Int(0))]))
-            .unwrap();
+        let err = Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::Arrow(_)));
+    }
+
+    /// Root Avro schema must be a Record
+    #[test]
+    fn test_single_column_error() {
+        let mut buff = Cursor::new(Vec::new());
+        let mut writer = Writer::new(&Schema::Int, &mut buff);
+        writer.append(1).unwrap();
+        writer.append(2).unwrap();
         writer.flush().unwrap();
         mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let iter = scanner.try_into_iter(1024, Some(&["missing"]));
-        assert!(matches!(
-            iter,
-            Err(Error::Polars(PolarsError::ColumnNotFound(_)))
-        ));
+        buff.set_position(0);
+        let err = Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::Arrow(_)));
     }
 
-    /// Test non-record avro fails
+    /// Test failure on `with_columns` when column isn't present
     #[test]
-    fn test_non_record() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(r#""int""#).unwrap();
-        {
-            let mut writer = Writer::new(&schema, &mut buff);
-            writer.append(Value::Int(0)).unwrap();
-            writer.append(Value::Int(1)).unwrap();
-            writer.append(Value::Int(4)).unwrap();
-            writer.flush().unwrap();
-        }
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let res = AvroScanner::new([buff], None);
-        assert!(matches!(res, Err(Error::NonRecordSchema(_))));
+    fn test_missing_columns_error() {
+        let res = Reader::try_new(
+            [File::open("./resources/food.avro")],
+            ReadOptions {
+                projection: Some(&["missing"][..]),
+                ..ReadOptions::default()
+            },
+        );
+        assert!(matches!(res, Err(Error::ColumnNotFound(_))));
     }
 
-    /// Test non-record avro fails
     #[test]
-    fn test_single_column_name() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(r#""int""#).unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer.append(Value::Int(0)).unwrap();
-        writer.append(Value::Int(1)).unwrap();
-        writer.append(Value::Int(4)).unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], Some("col".into())).unwrap();
-        let frame = read_scan(scanner);
-        let expected = df! {
-            "col" => [0, 1, 4]
-        }
-        .unwrap();
-        assert_eq!(frame, expected);
-    }
+    fn test_different_schemas() {
+        let one = write_avro("x", Schema::Int, [1, 2, 3]).unwrap();
+        let two = write_avro("y", Schema::String, ["a", "b", "c"]).unwrap();
 
-    /// Test that scanner can appropriately read schemas with references
-    #[test]
-    fn test_references() {
-        let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::parse_str(
-            r#"
-        {
-            "type": "record",
-            "name": "base",
-            "fields": [
-                {"name": "first", "type": "enum", "symbols": ["a"]},
-                {"name": "second", "type": { "type": "enum", "name": "explicit.second", "symbols": ["b"]}},
-                {"name": "a", "type": { "name": "a", "type": "record", "namespace": "outer", "fields": [
-                    {"name": "first", "type": "enum", "symbols": ["c"]},
-                    {"name": "fourth", "namespace": "explicit", "type": "enum", "symbols": ["d"]},
-                    {"name": "b", "type": {"name": "b", "type": "record", "fields": [
-                        {"name": "fifth", "type": "enum", "symbols": ["e"]},
-                        {"name": "sixth", "namespace": "explicit", "type": "enum", "symbols": ["f"]},
-                        {"name": "c", "type": { "name": "inner.c", "type": "record", "fields": [
-                            {"name": "first", "type": "enum", "symbols": ["g"]},
-                            {"name": "eighth", "namespace": "explicit", "type": "enum", "symbols": ["h"]},
-                            {"name": "ninth", "type": "first"},
-                            {"name": "tenth", "type": "outer.first"},
-                            {"name": "eleventh", "type": "explicit.second"}
-                        ]}},
-                        {"name": "twlevth", "type": "first"},
-                        {"name": "thirteenth", "type": "inner.first"},
-                        {"name": "fourteenth", "type": "explicit.eighth"}
-                    ]}},
-                    {"name": "fifteenth", "type": "first"},
-                    {"name": "sixteenth", "type": "inner.first"},
-                    {"name": "seventeenth", "type": "explicit.sixth"}
-                ]}},
-                {"name": "eighteenth", "type": "first"},
-                {"name": "nineteenth", "type": "inner.first"},
-                {"name": "twentyth", "type": "outer.first"}
-            ]
-        }
-        "#,
+        let iter = Reader::try_new(
+            [ok(one), ok(two)],
+            ReadOptions {
+                batch_size: 2,
+                ..FullReadOptions::default()
+            },
         )
         .unwrap();
-        let mut writer = Writer::new(&schema, &mut buff);
-        writer
-            .append(Value::Record(vec![
-                ("first".into(), Value::Enum(0, "a".into())),
-                ("second".into(), Value::Enum(0, "b".into())),
-                (
-                    "a".into(),
-                    Value::Record(vec![
-                        ("first".into(), Value::Enum(0, "c".into())),
-                        ("fourth".into(), Value::Enum(0, "d".into())),
-                        (
-                            "b".into(),
-                            Value::Record(vec![
-                                ("fifth".into(), Value::Enum(0, "e".into())),
-                                ("sixth".into(), Value::Enum(0, "f".into())),
-                                (
-                                    "c".into(),
-                                    Value::Record(vec![
-                                        ("first".into(), Value::Enum(0, "g".into())),
-                                        ("eighth".into(), Value::Enum(0, "h".into())),
-                                        ("ninth".into(), Value::Enum(0, "g".into())),
-                                        ("tenth".into(), Value::Enum(0, "c".into())),
-                                        ("eleventh".into(), Value::Enum(0, "b".into())),
-                                    ]),
-                                ),
-                                ("twlevth".into(), Value::Enum(0, "c".into())),
-                                ("thirteenth".into(), Value::Enum(0, "g".into())),
-                                ("fourteenth".into(), Value::Enum(0, "h".into())),
-                            ]),
-                        ),
-                        ("fifteenth".into(), Value::Enum(0, "c".into())),
-                        ("sixteenth".into(), Value::Enum(0, "g".into())),
-                        ("seventeenth".into(), Value::Enum(0, "f".into())),
-                    ]),
-                ),
-                ("eighteenth".into(), Value::Enum(0, "a".into())),
-                ("nineteenth".into(), Value::Enum(0, "g".into())),
-                ("twentyth".into(), Value::Enum(0, "c".into())),
-            ]))
-            .unwrap();
-        writer.flush().unwrap();
-        mem::drop(writer);
-        buff.seek(SeekFrom::Start(0)).unwrap();
-        let scanner = AvroScanner::new([buff], None).unwrap();
-        let frame = read_scan(scanner);
-        assert_eq!(frame.height(), 1);
-        assert_eq!(frame.width(), 6);
+        let err = iter.collect::<Result<Vec<_>, _>>().unwrap_err();
+        assert!(matches!(err, Error::NonMatchingSchemas { .. }));
+    }
+
+    // arrow-avro reads null map values as empty lists instead of null
+    test_read_type!(test_null_map: "map",
+        Schema::Union(UnionSchema::new(vec![
+            Schema::Null,
+            Schema::Map(MapSchema {
+                types: Box::new(Schema::Int),
+                attributes: BTreeMap::new(),
+            }),
+        ]).unwrap()),
+        [
+            Value::Union(1, Box::new(Value::Map(HashMap::from([("a".into(), Value::Int(1))])))),
+            Value::Union(0, Box::new(Value::Null)),
+            Value::Union(1, Box::new(Value::Map(HashMap::from([("b".into(), Value::Int(2))])))),
+        ],
+        Series::new("map".into(), [
+            map_struct("1", ["a"], [1]),
+            map_struct("2", [], [] as [i32; 0]),
+            map_struct("3", ["b"], [2]),
+        ])
+    );
+
+    // arrow-avro reads null list values correctly
+    test_read_type!(test_null_list: "list",
+        Schema::Union(UnionSchema::new(vec![
+            Schema::Null,
+            Schema::Array(ArraySchema {
+                items: Box::new(Schema::Int),
+                attributes: BTreeMap::new(),
+            }),
+        ]).unwrap()),
+        [
+            Value::Union(1, Box::new(Value::Array(vec![Value::Int(1), Value::Int(2)]))),
+            Value::Union(0, Box::new(Value::Null)),
+            Value::Union(1, Box::new(Value::Array(vec![Value::Int(3)]))),
+        ],
+        Series::new("list".into(), &[
+            Some(Series::from_iter([1_i32, 2_i32])),
+            None,
+            Some(Series::from_iter([3_i32])),
+        ])
+    );
+
+    #[test]
+    fn test_different_schemas_projection() {
+        let one = write_avro("x", Schema::Int, [1, 2, 3]).unwrap();
+        let two = write_avro("y", Schema::String, ["a", "b", "c"]).unwrap();
+
+        let iter = Reader::try_new(
+            [ok(one), ok(two)],
+            ReadOptions {
+                batch_size: 2,
+                projection: Some(&["x"][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap();
+        let err = iter.collect::<Result<Vec<_>, _>>().unwrap_err();
+        assert!(matches!(err, Error::ColumnNotFound(_)));
     }
 }

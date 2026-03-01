@@ -4,41 +4,39 @@ from io import BytesIO
 from pathlib import Path
 
 import polars as pl
-import pytest
 
-from polars_avro import AvroSpecError, read_avro, write_avro
-
-from .utils import frames_equal
+from polars_avro import read_avro, write_avro
 
 
 def test_binary_write() -> None:
     """Test writing to a buffer."""
     buff = BytesIO()
     frame = pl.from_dict({"x": [1]})
-    write_avro(frame, buff)
+    write_avro([frame], buff)
     buff.seek(0)
     duplicate = read_avro(buff)
-    assert frames_equal(frame, duplicate)
+    assert frame.equals(duplicate)
 
 
 def test_chunked_binary_write() -> None:
     """Test writing to a buffer."""
     buff = BytesIO()
-    frame = pl.from_dict({"x": [1, 2]})
-    write_avro(frame, buff, batch_size=1)
+    one = pl.from_dict({"x": [1, 2]})
+    two = pl.from_dict({"x": [3, 4]})
+    write_avro([one, two], buff)
     buff.seek(0)
     duplicate = read_avro(buff)
-    assert frames_equal(frame, duplicate)
+    assert pl.concat([one, two]).equals(duplicate)
 
 
 def test_empty_write() -> None:
     """Test writing an empty frame."""
     buff = BytesIO()
     frame = pl.from_dict({"x": []}, schema={"x": pl.Int32})
-    write_avro(frame, buff)
+    write_avro([frame], buff)
     buff.seek(0)
     duplicate = read_avro(buff)
-    assert frames_equal(frame, duplicate)
+    assert frame.equals(duplicate)
 
 
 def test_struct_write() -> None:
@@ -55,10 +53,10 @@ def test_struct_write() -> None:
             )
         },
     )
-    write_avro(frame, buff)
+    write_avro([frame], buff)
     buff.seek(0)
     duplicate = read_avro(buff)
-    assert frames_equal(frame, duplicate)
+    assert frame.equals(duplicate)
 
 
 def test_complex_write() -> None:
@@ -79,10 +77,10 @@ def test_complex_write() -> None:
             )
         },
     )
-    write_avro(frame, buff)
+    write_avro([frame], buff)
     buff.seek(0)
     duplicate = read_avro(buff)
-    assert frames_equal(frame, duplicate)
+    assert frame.equals(duplicate)
 
 
 def test_file_write(tmp_path: Path) -> None:
@@ -90,24 +88,16 @@ def test_file_write(tmp_path: Path) -> None:
     path = tmp_path / "test.avro"
 
     frame = pl.from_dict({"x": [1]})
-    write_avro(frame, path)
+    write_avro([frame], path)
     duplicate = read_avro(path)
-    assert frames_equal(frame, duplicate)
+    assert frame.equals(duplicate)
 
 
-def test_no_int_promotion() -> None:
-    """Test exception when writing ints without promotion."""
-    buff = BytesIO()
-    frame = pl.from_dict({"x": [1]}, schema={"x": pl.Int8})
-    with pytest.raises(AvroSpecError, match="unsupported type in write conversion: i8"):
-        write_avro(frame, buff, promote_ints=False)
-
-
-def test_no_array_promotion() -> None:
-    """Test exception when writing arrays without promotion."""
+def test_write_array() -> None:
+    """Test writing array columns (FixedSizeList is natively supported)."""
     buff = BytesIO()
     frame = pl.from_dict({"x": [[1]]}, schema={"x": pl.Array(pl.Int32, 1)})
-    with pytest.raises(
-        AvroSpecError, match="unsupported type in write conversion: array"
-    ):
-        write_avro(frame, buff, promote_array=False)
+    write_avro([frame], buff)
+    buff.seek(0)
+    duplicate = read_avro(buff)
+    assert frame.equals(duplicate)

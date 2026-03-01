@@ -1,21 +1,19 @@
-"""Scan and sink avro files using Polars.
+"""Polars io plugin for reading and writing Apache Avro files.
 
-This module provides three functions: `scan_avro`, `write_avro`, and `read_avro`
-written as an io-plugin. Currently `sink` is not supported for io-plugins.
-
-Not all types can be converted between Polars and Avro, or are supported but
-with precision loss. In general this library will attempt to read and write
-everything as long as there's no data loss, but that can mean promoting types to
-make them more general for serialization / deserialization.
+Provides `scan_avro`, `read_avro`, `write_avro`, and `AvroWriter`. Some polars
+types (Int8, Int16, UInt8, UInt16, UInt32, UInt64, Time, Categorical, Enum)
+must be cast before writing. When reading, the ``utf8_view`` option controls
+how UUIDs and nullable strings are decoded — see `scan_avro` for details.
 """
 
 from ._avro_rs import AvroError, AvroSpecError, Codec, EmptySources
 from ._scan import read_avro, scan_avro
-from ._sink import write_avro
+from ._sink import AvroWriter, write_avro
 
 __all__ = (
     "AvroError",
     "AvroSpecError",
+    "AvroWriter",
     "Codec",
     "EmptySources",
     "read_avro",
