@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from glob import iglob
 from os import path
 from pathlib import Path
@@ -9,6 +9,7 @@ from polars import DataFrame, Expr, LazyFrame
 from polars.io.plugins import register_io_source
 
 from ._avro_rs import AvroSource
+from ._cloud import CredentialProviderInput, resolve_credentials
 
 
 def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
@@ -29,6 +30,8 @@ def scan_avro(  # noqa: PLR0913
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
+    storage_options: Mapping[str, str] | None = None,
+    credential_provider: CredentialProviderInput = "auto",
 ) -> LazyFrame:
     """Scan Avro files.
 
@@ -44,6 +47,11 @@ def scan_avro(  # noqa: PLR0913
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
+    storage_options : Extra configuration passed to the cloud storage
+        backend (same keys accepted by Polars, e.g. ``aws_region``).
+    credential_provider : Credential provider for cloud storage. Set to
+        ``"auto"`` (default) to use automatic credential detection, or
+        ``None`` to disable.
     """
     # normalize sources
     strs: list[str] = []
@@ -60,10 +68,12 @@ def scan_avro(  # noqa: PLR0913
         case _:
             bins.append(sources)
 
-    # normalize cloud options
+    # resolve credentials
+    options = resolve_credentials(credential_provider, strs, storage_options)
+
     def_batch_size = batch_size
 
-    src = AvroSource(strs, bins)
+    src = AvroSource(strs, bins, options)
 
     def get_schema() -> pl.Schema:
         return pl.Schema(src.schema())
@@ -89,11 +99,7 @@ def scan_avro(  # noqa: PLR0913
                 if n_rows == 0:
                     break
 
-    try:
-        return register_io_source(source_generator, schema=get_schema)
-    except TypeError:  # pragma: no cover
-        eager_schema = get_schema()
-        return register_io_source(source_generator, schema=eager_schema)
+    return register_io_source(source_generator, schema=get_schema)
 
 
 def read_avro(  # noqa: PLR0913
@@ -108,6 +114,8 @@ def read_avro(  # noqa: PLR0913
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
+    storage_options: Mapping[str, str] | None = None,
+    credential_provider: CredentialProviderInput = "auto",
 ) -> DataFrame:
     """Read an Avro file into a DataFrame.
 
@@ -128,6 +136,11 @@ def read_avro(  # noqa: PLR0913
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
+    storage_options : Extra configuration passed to the cloud storage
+        backend (same keys accepted by Polars, e.g. ``aws_region``).
+    credential_provider : Credential provider for cloud storage. Set to
+        ``"auto"`` (default) to use automatic credential detection, or
+        ``None`` to disable.
     """
     lazy = scan_avro(
         sources,
@@ -135,6 +148,8 @@ def read_avro(  # noqa: PLR0913
         glob=glob,
         strict=strict,
         utf8_view=utf8_view,
+        storage_options=storage_options,
+        credential_provider=credential_provider,
     )
     if columns is not None:
         lazy = lazy.select(  # type: ignore

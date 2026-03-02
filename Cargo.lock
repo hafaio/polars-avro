@@ -2356,6 +2356,7 @@ dependencies = [
  "arrow-avro",
  "bigdecimal",
  "chrono",
+ "object_store",
  "polars",
  "polars-arrow",
  "polars-io",

@@ -2,12 +2,17 @@
 
 use super::{Error, ReadOptions, Reader, Writer, get_schema};
 use arrow_avro::compression::CompressionCodec;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStoreExt, PutPayload};
 use polars::prelude::{PlSmallStr, Schema};
+use polars_io::cloud::{CloudOptions, PolarsObjectStore, build_object_store};
+use polars_io::pl_async::get_runtime;
+use polars_utils::pl_path::CloudScheme;
 use pyo3::exceptions::{PyException, PyIOError, PyIndexError, PyKeyError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
 use pyo3::{
-    Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python, create_exception, pyclass, pymethods,
-    pymodule,
+    Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python, create_exception, pyclass, pyfunction,
+    pymethods, pymodule, wrap_pyfunction,
 };
 use pyo3_polars::error::PyPolarsErr;
 use pyo3_polars::{PyDataFrame, PyDataType, PySchema};
@@ -17,9 +22,147 @@ use std::iter::{Chain, Fuse};
 use std::sync::Arc;
 
 #[derive(Debug)]
+struct CloudReader {
+    store: PolarsObjectStore,
+    path: ObjectPath,
+    position: u64,
+}
+
+impl CloudReader {
+    fn try_new(
+        url: impl AsRef<str>,
+        storage_options: &[(impl AsRef<str>, impl AsRef<str>)],
+    ) -> Result<Self, Error> {
+        get_runtime().block_on(async {
+            let options = if storage_options.is_empty() {
+                None
+            } else {
+                let scheme = CloudScheme::from_path(url.as_ref());
+                Some(CloudOptions::from_untyped_config(
+                    scheme,
+                    storage_options
+                        .iter()
+                        .map(|(k, v)| (k.as_ref(), v.as_ref())),
+                )?)
+            };
+            let (cl, store) =
+                build_object_store(url.as_ref().into(), options.as_ref(), false).await?;
+            let path = ObjectPath::from(cl.prefix.as_str());
+            Ok(Self {
+                store,
+                path,
+                position: 0,
+            })
+        })
+    }
+}
+
+impl Read for CloudReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let pos = usize::try_from(self.position).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current file position doesn't fit in a usize",
+            )
+        })?;
+        let range = pos..(pos + buf.len());
+        let data = match get_runtime().block_on(self.store.get_range(&self.path, range)) {
+            Ok(data) => data,
+            Err(_) => return Ok(0), // FIXME why is this an ok not an weeoe?
+        };
+        let n = data.len();
+        buf[..n].copy_from_slice(&data);
+        self.position += u64::try_from(n)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read too long for a u64"))?;
+        Ok(n)
+    }
+}
+
+impl Seek for CloudReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos: u64 = match pos {
+            SeekFrom::Start(p) => Ok(p),
+            SeekFrom::Current(offset) => {
+                if offset < 0 {
+                    self.position
+                        .checked_sub(offset.unsigned_abs())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                        })
+                } else {
+                    self.position
+                        .checked_add(offset.unsigned_abs())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "seek beyond u64")
+                        })
+                }
+            }
+            SeekFrom::End(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "seeking from end is not supported",
+            )),
+        }?;
+        self.position = new_pos;
+        Ok(new_pos)
+    }
+}
+
+struct CloudWriter {
+    store: PolarsObjectStore,
+    path: ObjectPath,
+}
+
+impl CloudWriter {
+    fn try_new(
+        url: impl AsRef<str>,
+        storage_options: &[(impl AsRef<str>, impl AsRef<str>)],
+    ) -> Result<Self, Error> {
+        get_runtime().block_on(async {
+            let options = if storage_options.is_empty() {
+                None
+            } else {
+                let scheme = CloudScheme::from_path(url.as_ref());
+                Some(CloudOptions::from_untyped_config(
+                    scheme,
+                    storage_options
+                        .iter()
+                        .map(|(k, v)| (k.as_ref(), v.as_ref())),
+                )?)
+            };
+            let (cl, store) =
+                build_object_store(url.as_ref().into(), options.as_ref(), false).await?;
+            let path = ObjectPath::from(cl.prefix.as_str());
+            Ok(Self { store, path })
+        })
+    }
+}
+
+impl Write for CloudWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        get_runtime()
+            .block_on(async {
+                let store = self.store.to_dyn_object_store().await;
+                store.put(&self.path, PutPayload::from(buf.to_vec())).await
+            })
+            .map_err(io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Returns `true` when `url` begins with a recognised cloud scheme.
+fn is_cloud_url(url: &str) -> bool {
+    CloudScheme::from_path(url).is_some()
+}
+
+#[derive(Debug)]
 enum ScanSource {
     File(File),
     Bytes(PyIO),
+    Cloud(BufReader<CloudReader>),
 }
 
 impl Read for ScanSource {
@@ -27,6 +170,7 @@ impl Read for ScanSource {
         match self {
             ScanSource::File(reader) => reader.read(buf),
             ScanSource::Bytes(cursor) => cursor.read(buf),
+            ScanSource::Cloud(reader) => reader.read(buf),
         }
     }
 }
@@ -36,6 +180,7 @@ impl Seek for ScanSource {
         match self {
             ScanSource::File(reader) => reader.seek(pos),
             ScanSource::Bytes(cursor) => cursor.seek(pos),
+            ScanSource::Cloud(reader) => reader.seek(pos),
         }
     }
 }
@@ -70,12 +215,17 @@ impl Iterator for BytesIter {
 #[derive(Debug)]
 struct PathIter {
     paths: Arc<[String]>,
+    storage_options: Arc<[(String, String)]>,
     idx: usize,
 }
 
 impl PathIter {
-    fn new(paths: Arc<[String]>) -> Self {
-        Self { paths, idx: 0 }
+    fn new(paths: Arc<[String]>, storage_options: Arc<[(String, String)]>) -> Self {
+        Self {
+            paths,
+            storage_options,
+            idx: 0,
+        }
     }
 }
 
@@ -85,9 +235,16 @@ impl Iterator for PathIter {
     fn next(&mut self) -> Option<Self::Item> {
         self.paths.get(self.idx).map(|path| {
             self.idx += 1;
-            match File::open(path) {
-                Ok(file) => Ok(ScanSource::File(file)),
-                Err(err) => Err(Error::IO(err, path.clone())),
+            if is_cloud_url(path) {
+                Ok(ScanSource::Cloud(BufReader::with_capacity(
+                    4 * 1024 * 1024, // want a larger buffer for cloud reads
+                    CloudReader::try_new(path, &self.storage_options)?,
+                )))
+            } else {
+                match File::open(path) {
+                    Ok(file) => Ok(ScanSource::File(file)),
+                    Err(err) => Err(Error::IO(err, path.clone())),
+                }
             }
         })
     }
@@ -182,12 +339,14 @@ impl Seek for PyIO {
 pub struct AvroSource {
     paths: Arc<[String]>,
     buffs: Arc<[(PyIO, u64)]>,
+    storage_options: Arc<[(String, String)]>,
     schema: Option<Arc<Schema>>,
 }
 
 impl AvroSource {
     fn get_sources(&self) -> SourceIter {
-        PathIter::new(self.paths.clone()).chain(BytesIter::new(self.buffs.clone()))
+        PathIter::new(self.paths.clone(), self.storage_options.clone())
+            .chain(BytesIter::new(self.buffs.clone()))
     }
 
     fn get_schema(&mut self) -> Result<Arc<Schema>, Error> {
@@ -205,8 +364,12 @@ impl AvroSource {
 #[pymethods]
 impl AvroSource {
     #[new]
-    #[pyo3(signature = (paths, buffs))]
-    fn new(paths: Vec<String>, buffs: Vec<Py<PyAny>>) -> Result<Self, PyErr> {
+    #[pyo3(signature = (paths, buffs, storage_options))]
+    fn new(
+        paths: Vec<String>,
+        buffs: Vec<Py<PyAny>>,
+        storage_options: Vec<(String, String)>,
+    ) -> Result<Self, PyErr> {
         Ok(Self {
             paths: paths.into(),
             buffs: buffs
@@ -216,6 +379,7 @@ impl AvroSource {
                     buff.stream_position().map(move |pos| (buff, pos))
                 })
                 .collect::<Result<_, _>>()?,
+            storage_options: storage_options.into(),
             schema: None,
         })
     }
@@ -304,7 +468,6 @@ impl From<PySchemaRef> for Schema {
     }
 }
 
-// TODO Add credentials when stabilized
 #[pyclass]
 pub struct AvroFileSink(Writer<BufWriter<File>>);
 
@@ -325,6 +488,9 @@ impl AvroFileSink {
     fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
         Ok(self.0.write(&batch.0)?)
     }
+
+    #[pyo3(signature = ())]
+    fn close(&mut self) {}
 }
 
 #[pyclass]
@@ -347,6 +513,60 @@ impl AvroBuffSink {
     fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
         Ok(self.0.write(&batch.0)?)
     }
+
+    #[pyo3(signature = ())]
+    fn close(&mut self) {}
+}
+
+#[pyclass]
+pub struct AvroCloudSink(Option<Writer<BufWriter<CloudWriter>>>);
+
+#[pymethods]
+impl AvroCloudSink {
+    #[new]
+    #[pyo3(signature = (url, fields, codec, storage_options))]
+    fn new(
+        url: &str,
+        fields: PySchemaRef,
+        codec: Codec,
+        storage_options: Vec<(String, String)>,
+    ) -> Result<Self, PyErr> {
+        let cloud_writer = CloudWriter::try_new(url, &storage_options)?;
+        Ok(Self(Some(Writer::try_new(
+            BufWriter::with_capacity(4 * 1024 * 1024, cloud_writer),
+            &fields.into(),
+            codec.into(),
+        )?)))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (batch))]
+    fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("sink is already closed"))?
+            .write(&batch.0)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = ())]
+    fn close(&mut self) -> Result<(), PyErr> {
+        let writer = self
+            .0
+            .take()
+            .ok_or_else(|| PyIOError::new_err("sink is already closed"))?;
+        let buf_writer = writer.into_inner()?;
+        buf_writer
+            .into_inner()
+            .map_err(|e| PyIOError::new_err(format!("error flushing buffer: {e}")))?;
+        Ok(())
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (url,))]
+fn py_is_cloud_url(url: &str) -> bool {
+    is_cloud_url(url)
 }
 
 impl From<Error> for PyErr {
@@ -388,7 +608,9 @@ fn polars_avro(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AvroSource>()?;
     m.add_class::<AvroFileSink>()?;
     m.add_class::<AvroBuffSink>()?;
+    m.add_class::<AvroCloudSink>()?;
     m.add_class::<Codec>()?;
+    m.add_function(wrap_pyfunction!(py_is_cloud_url, m)?)?;
     m.add("AvroError", py.get_type::<AvroError>())?;
     m.add("EmptySources", py.get_type::<EmptySources>())?;
     m.add("AvroSpecError", py.get_type::<AvroSpecError>())?;
