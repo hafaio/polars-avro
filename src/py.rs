@@ -26,6 +26,7 @@ struct CloudReader {
     store: PolarsObjectStore,
     path: ObjectPath,
     position: u64,
+    size: u64,
 }
 
 impl CloudReader {
@@ -48,10 +49,12 @@ impl CloudReader {
             let (cl, store) =
                 build_object_store(url.as_ref().into(), options.as_ref(), false).await?;
             let path = ObjectPath::from(cl.prefix.as_str());
+            let meta = store.head(&path).await?;
             Ok(Self {
                 store,
                 path,
                 position: 0,
+                size: meta.size as u64,
             })
         })
     }
@@ -59,17 +62,22 @@ impl CloudReader {
 
 impl Read for CloudReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.size {
+            return Ok(0);
+        }
         let pos = usize::try_from(self.position).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "current file position doesn't fit in a usize",
             )
         })?;
-        let range = pos..(pos + buf.len());
-        let data = match get_runtime().block_on(self.store.get_range(&self.path, range)) {
-            Ok(data) => data,
-            Err(_) => return Ok(0), // FIXME why is this an ok not an weeoe?
-        };
+        let end = (pos + buf.len()).min(usize::try_from(self.size).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "read too long for a usize")
+        })?);
+        let range = pos..end;
+        let data = get_runtime()
+            .block_on(self.store.get_range(&self.path, range))
+            .map_err(io::Error::other)?;
         let n = data.len();
         buf[..n].copy_from_slice(&data);
         self.position += u64::try_from(n)
@@ -97,10 +105,17 @@ impl Seek for CloudReader {
                         })
                 }
             }
-            SeekFrom::End(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "seeking from end is not supported",
-            )),
+            SeekFrom::End(offset) => {
+                if offset > 0 {
+                    self.size.checked_add(offset.unsigned_abs()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek beyond u64")
+                    })
+                } else {
+                    self.size.checked_sub(offset.unsigned_abs()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                    })
+                }
+            }
         }?;
         self.position = new_pos;
         Ok(new_pos)
@@ -490,6 +505,7 @@ impl AvroFileSink {
     }
 
     #[pyo3(signature = ())]
+    #[allow(clippy::unused_self)]
     fn close(&mut self) {}
 }
 
@@ -515,6 +531,7 @@ impl AvroBuffSink {
     }
 
     #[pyo3(signature = ())]
+    #[allow(clippy::unused_self)]
     fn close(&mut self) {}
 }
 
@@ -525,6 +542,7 @@ pub struct AvroCloudSink(Option<Writer<BufWriter<CloudWriter>>>);
 impl AvroCloudSink {
     #[new]
     #[pyo3(signature = (url, fields, codec, storage_options))]
+    #[allow(clippy::needless_pass_by_value)]
     fn new(
         url: &str,
         fields: PySchemaRef,
@@ -539,8 +557,8 @@ impl AvroCloudSink {
         )?)))
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     #[pyo3(signature = (batch))]
+    #[allow(clippy::needless_pass_by_value)]
     fn write(&mut self, batch: PyDataFrame) -> Result<(), PyErr> {
         self.0
             .as_mut()
