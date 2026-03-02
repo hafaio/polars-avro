@@ -142,6 +142,8 @@ Standard `cargo` commands will build and test the rust library.
 
 The python library is built with uv and maturin. The rust components should build once, ance otherwise allow usage and testing.
 
+You may need to recompile the python bindings with `uv run maturin develop`.
+
 ### Testing
 
 ```sh
@@ -177,4 +179,3 @@ uv publish --username __token__
 
 - [ ] reimplement single column reader?
 - [ ] reimplement better workarounds for types that don't exist, e.g. serialize polars cat/enum to arrow enum and vice versa
-- [ ] aws / parity with polars remote storage reading

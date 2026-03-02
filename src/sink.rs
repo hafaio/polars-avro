@@ -34,6 +34,15 @@ impl<W: Write> Writer<W> {
         Ok(Writer { base, schema })
     }
 
+    /// Finish writing and return the underlying writer.
+    ///
+    /// # Errors
+    /// If there were problems flushing the writer
+    pub fn into_inner(mut self) -> Result<W, Error> {
+        self.base.finish()?;
+        Ok(self.base.into_inner())
+    }
+
     /// Write a single dataframe chunk
     ///
     /// # Errors
