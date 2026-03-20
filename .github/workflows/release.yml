@@ -161,7 +161,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml uv.lock
           git commit -m "v${VERSION}"
-          git tag "v${VERSION}"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
           git push --follow-tags
       - name: Create GitHub release
         env:
