@@ -3,6 +3,7 @@
 use apache_avro::Error as AvroError;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
+use arrow_avro::errors::AvroError as ArrowAvroError;
 use polars::error::PolarsError;
 use polars::prelude::DataType;
 use std::collections::HashMap;
@@ -20,6 +21,8 @@ pub enum Error {
     Polars(PolarsError),
     /// An error from the arrow library
     Arrow(ArrowError),
+    /// An error from the arrow-avro library
+    ArrowAvro(ArrowAvroError),
     /// An error from parsing the avro header
     Avro(AvroError),
     /// Cannot scan empty sources
@@ -55,6 +58,7 @@ impl Display for Error {
         match self {
             Error::Polars(e) => write!(f, "Error from polars: {e}"),
             Error::Arrow(e) => write!(f, "Error from arrow: {e}"),
+            Error::ArrowAvro(e) => write!(f, "Error from arrow-avro: {e}"),
             Error::Avro(e) => write!(f, "Error from avro: {e}"),
             Error::EmptySources => write!(f, "Cannot scan empty sources"),
             Error::NonRecordSchema => write!(f, "Top level avro schema must be a record"),
@@ -108,6 +112,12 @@ impl StdError for Error {}
 impl From<ArrowError> for Error {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value)
+    }
+}
+
+impl From<ArrowAvroError> for Error {
+    fn from(value: ArrowAvroError) -> Self {
+        Self::ArrowAvro(value)
     }
 }
 
