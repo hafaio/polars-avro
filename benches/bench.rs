@@ -115,7 +115,7 @@ macro_rules! bench_shape {
 
             #[bench]
             fn write_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
+                let frame = $frame_expr;
                 b.iter(|| {
                     test::black_box(
                         Writer::try_new(Vec::new(), frame.schema(), None)
@@ -128,28 +128,30 @@ macro_rules! bench_shape {
 
             #[bench]
             fn write_polars_native(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
+                let frame = $frame_expr;
                 b.iter(|| {
                     test::black_box(
-                        AvroWriter::new(&mut Vec::new())
+                        AvroWriter::new(Vec::new())
                             .with_name("".to_owned())
-                            .finish(&mut frame.clone()),
+                            .finish(&mut frame.clone())
+                            .unwrap(),
                     )
                 });
             }
 
             #[bench]
             fn read_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
-                b.iter(|| {
+                b.iter(move || {
+                    buff.set_position(0);
                     test::black_box(
                         Reader::try_new(
-                            [Ok::<_, Infallible>(Cursor::new(buff.clone()))],
+                            [Ok::<_, Infallible>(&mut buff)],
                             FullReadOptions::default(),
                         )
                         .unwrap()
@@ -160,13 +162,16 @@ macro_rules! bench_shape {
 
             #[bench]
             fn read_polars_native(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
-                b.iter(|| test::black_box(AvroReader::new(Cursor::new(buff.clone())).finish()));
+                b.iter(move || {
+                    buff.set_position(0);
+                    test::black_box(AvroReader::new(&mut buff).finish().unwrap());
+                });
             }
         }
     };
@@ -179,7 +184,7 @@ macro_rules! bench_shape_avro_only {
 
             #[bench]
             fn write_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
+                let frame = $frame_expr;
                 b.iter(|| {
                     test::black_box(
                         Writer::try_new(Vec::new(), frame.schema(), None)
@@ -192,16 +197,17 @@ macro_rules! bench_shape_avro_only {
 
             #[bench]
             fn read_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
-                b.iter(|| {
+                b.iter(move || {
+                    buff.set_position(0);
                     test::black_box(
                         Reader::try_new(
-                            [Ok::<_, Infallible>(Cursor::new(buff.clone()))],
+                            [Ok::<_, Infallible>(&mut buff)],
                             FullReadOptions::default(),
                         )
                         .unwrap()
@@ -220,17 +226,18 @@ macro_rules! bench_projection {
 
             #[bench]
             fn read_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
                 let columns: Vec<&str> = vec![$($col),+];
-                b.iter(|| {
+                b.iter(move || {
+                    buff.set_position(0);
                     test::black_box(
                         Reader::try_new(
-                            [Ok::<_, Infallible>(Cursor::new(buff.clone()))],
+                            [Ok::<_, Infallible>(&mut buff)],
                             ReadOptions {
                                 projection: Some(&columns[..]),
                                 ..ReadOptions::default()
@@ -244,18 +251,20 @@ macro_rules! bench_projection {
 
             #[bench]
             fn read_polars_native(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
                 let columns: Vec<String> = vec![$($col.to_owned()),+];
-                b.iter(|| {
+                b.iter(move || {
+                    buff.set_position(0);
                     test::black_box(
-                        AvroReader::new(Cursor::new(buff.clone()))
+                        AvroReader::new(&mut buff)
                             .with_columns(Some(columns.clone()))
-                            .finish(),
+                            .finish()
+                            .unwrap(),
                     )
                 });
             }
@@ -270,16 +279,17 @@ macro_rules! bench_read_options {
 
             #[bench]
             fn read_polars_avro(b: &mut Bencher) {
-                let frame: DataFrame = $frame_expr;
-                let mut buff: Vec<u8> = Vec::new();
+                let frame = $frame_expr;
+                let mut buff = Cursor::new(Vec::new());
                 Writer::try_new(&mut buff, frame.schema(), None)
                     .unwrap()
                     .write(&frame)
                     .unwrap();
-                b.iter(|| {
+                b.iter(move || {
+                    buff.set_position(0);
                     test::black_box(
                         Reader::try_new(
-                            [Ok::<_, Infallible>(Cursor::new(buff.clone()))],
+                            [Ok::<_, Infallible>(&mut buff)],
                             ReadOptions {
                                 $($field: $value,)*
                                 ..FullReadOptions::default()

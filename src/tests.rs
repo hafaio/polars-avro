@@ -1,5 +1,5 @@
 use super::{FullReadOptions, ReadOptions, Reader, Writer, get_schema};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use polars::df;
 use polars::prelude::null::MutableNullArray;
 use polars::prelude::{
@@ -98,6 +98,13 @@ test_transitivity!(test_transitivity_complex: df!(
         "name" => [Some("Alice Archer"), Some("Ben Brown"), Some("Chloe Cooper"), None],
         "weight" => [None, Some(72.5), Some(53.6), None],
         "height" => [Some(1.56_f32), None, Some(1.65_f32), Some(1.75_f32)],
+        "smol" => [Some(1_i8), None, Some(0_i8), Some(3_i8)],
+        "daytime" => [
+            Some(NaiveTime::from_hms_micro_opt(1, 1, 1, 1002).unwrap()),
+            None,
+            Some(NaiveTime::from_hms_micro_opt(2, 2, 2, 4005).unwrap()),
+            Some(NaiveTime::from_hms_micro_opt(3, 3, 3, 7008).unwrap()),
+        ],
         "birthtime" => [
             Some(NaiveDate::from_ymd_opt(1997, 1, 10).unwrap().and_hms_nano_opt(1, 2, 3, 1_002_003).unwrap()),
             Some(NaiveDate::from_ymd_opt(1985, 2, 15).unwrap().and_hms_nano_opt(4, 5, 6, 4_005_006).unwrap()),
@@ -154,14 +161,10 @@ test_transitivity!(test_transitivity_double_struct: df! {
 
 #[test]
 fn test_empty() {
-    // create empty frame (0 rows, 1 column — valid avro record)
     let frame: DataFrame = df!(
         "weight" => [0.0; 0],
     )
     .unwrap();
-
-    // write / read
     let reconstruction = deserialize(serialize(&frame));
-
     assert_eq!(frame, reconstruction);
 }
