@@ -592,6 +592,7 @@ impl From<Error> for PyErr {
         match value {
             Error::Polars(err) => PyPolarsErr::from(err).into(),
             Error::Arrow(err) => AvroError::new_err(err.to_string()),
+            Error::ArrowAvro(err) => AvroError::new_err(err.to_string()),
             Error::Avro(err) => AvroError::new_err(err.to_string()),
             Error::EmptySources => EmptySources::new_err("must scan at least one source"),
             Error::NonRecordSchema => {
