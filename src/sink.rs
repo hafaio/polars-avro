@@ -64,6 +64,9 @@ impl<W: Write> Writer<W> {
 mod tests {
     use super::Error;
     use super::Writer;
+    use apache_avro::Reader;
+    use apache_avro::types::Value;
+    use arrow_avro::errors::AvroError;
     use chrono::NaiveTime;
     use polars::df;
     use polars::prelude::{
@@ -73,12 +76,6 @@ mod tests {
 
     fn bad_frame() -> LazyFrame {
         df! {
-            "int" => [4_i8, 5_i8, 6_i8],
-            "time" => [
-                NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
-                NaiveTime::from_hms_opt(4, 5, 6).unwrap(),
-                NaiveTime::from_hms_opt(7, 8, 9).unwrap(),
-            ],
             "cat" => ["a", "b", "a"],
         }
         .unwrap()
@@ -139,13 +136,74 @@ mod tests {
     fn test_bad_frame_mitigations() {
         let batch = bad_frame()
             .with_columns([
-                pl::col("int").strict_cast(DataType::Int32),
-                pl::col("time").strict_cast(DataType::Int64),
                 pl::col("cat").strict_cast(DataType::Int32),
                 pl::col("enum").strict_cast(DataType::Int32),
             ])
             .collect()
             .unwrap();
+        Writer::try_new(Vec::new(), batch.schema(), None)
+            .unwrap()
+            .write(&batch)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_write_time() {
+        let batch = df! {
+            "time" => [
+                NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
+                NaiveTime::from_hms_opt(4, 5, 6).unwrap(),
+                NaiveTime::from_hms_opt(7, 8, 9).unwrap(),
+                NaiveTime::from_hms_opt(10, 11, 12).unwrap(),
+            ],
+        }
+        .unwrap();
+        Writer::try_new(Vec::new(), batch.schema(), None)
+            .unwrap()
+            .write(&batch)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_time_truncation() {
+        let batch = df! {
+            "time" => [
+                NaiveTime::from_hms_nano_opt(1, 2, 3, 1_002_003).unwrap(),
+            ],
+        }
+        .unwrap();
+        let mut buff = Vec::new();
+        Writer::try_new(&mut buff, batch.schema(), None)
+            .unwrap()
+            .write(&batch)
+            .unwrap();
+        let row = Reader::new(&*buff).unwrap().next().unwrap().unwrap();
+        let Value::Record(fields) = row else {
+            panic!("expected record");
+        };
+        let [(_, Value::Union(1, time))] = &*fields else {
+            panic!("expected singleton");
+        };
+        let Value::TimeMicros(val) = **time else {
+            panic!("expected time");
+        };
+        // truncated to remove nanos
+        assert_eq!(val, 3723001002);
+    }
+
+    #[test]
+    fn test_write_ints() {
+        let batch = df! {
+            "int8" => [1_i8, 2_i8, 3_i8],
+            "int16" => [4_i16, 5_i16, 6_i16],
+            "int32" => [7_i32, 8_i32, 9_i32],
+            "int64" => [10_i64, 11_i64, 12_i64],
+            "uint8" => [13_u8, 14_u8, 15_u8],
+            "uint16" => [16_u16, 17_u16, 18_u16],
+            "uint32" => [19_u32, 20_u32, 21_u32],
+            "uint64" => [22_u64, 23_u64, 24_u64],
+        }
+        .unwrap();
         Writer::try_new(Vec::new(), batch.schema(), None)
             .unwrap()
             .write(&batch)
@@ -175,62 +233,23 @@ mod tests {
             .unwrap()
             .write(&batch)
             .unwrap_err();
-        assert!(matches!(err, Error::Arrow(_)));
+        assert!(matches!(err, Error::ArrowAvro(_)));
     }
-
-    macro_rules! test_int_write_success {
-        ($name:ident, $type:ty) => {
-            #[test]
-            fn $name() {
-                let batch = df! { "int" => [4 as $type, 5 as $type, 6 as $type] }.unwrap();
-                Writer::try_new(Vec::new(), batch.schema(), None)
-                    .unwrap()
-                    .write(&batch)
-                    .unwrap();
-            }
-        };
-    }
-
-    macro_rules! test_int_write_error {
-        ($name:ident, $type:ty) => {
-            #[test]
-            fn $name() {
-                let batch = df! { "int" => [4 as $type, 5 as $type, 6 as $type] }.unwrap();
-                let err = Writer::try_new(Vec::new(), batch.schema(), None)
-                    .unwrap()
-                    .write(&batch)
-                    .unwrap_err();
-                assert!(matches!(err, Error::Arrow(_)));
-            }
-        };
-    }
-
-    test_int_write_success!(test_int32_success, i32);
-    test_int_write_success!(test_int64_success, i64);
-
-    test_int_write_error!(test_int8_error, i8);
-    test_int_write_error!(test_int16_error, i16);
-    test_int_write_error!(test_uint8_error, u8);
-    test_int_write_error!(test_uint16_error, u16);
-    test_int_write_error!(test_uint32_error, u32);
-    test_int_write_error!(test_uint64_error, u64);
 
     #[test]
-    fn test_time_error() {
+    fn test_large_uint64_error() {
         let batch = df! {
-            "time" => [
-                NaiveTime::from_hms_opt(1, 2, 3).unwrap(),
-                NaiveTime::from_hms_opt(4, 5, 6).unwrap(),
-                NaiveTime::from_hms_opt(7, 8, 9).unwrap(),
-                NaiveTime::from_hms_opt(10, 11, 12).unwrap(),
-            ],
+            "uint64" => [u64::MAX],
         }
         .unwrap();
         let err = Writer::try_new(Vec::new(), batch.schema(), None)
             .unwrap()
             .write(&batch)
             .unwrap_err();
-        assert!(matches!(err, Error::Arrow(_)));
+        assert!(matches!(
+            err,
+            Error::ArrowAvro(AvroError::InvalidArgument(_))
+        ));
     }
 
     #[test]
@@ -247,7 +266,7 @@ mod tests {
             .unwrap()
             .write(&batch)
             .unwrap_err();
-        assert!(matches!(err, Error::Arrow(_)));
+        assert!(matches!(err, Error::ArrowAvro(_)));
     }
 
     #[test]
@@ -268,6 +287,6 @@ mod tests {
             .unwrap()
             .write(&batch)
             .unwrap_err();
-        assert!(matches!(err, Error::Arrow(_)));
+        assert!(matches!(err, Error::ArrowAvro(_)));
     }
 }
