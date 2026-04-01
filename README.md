@@ -56,17 +56,13 @@ polars types than you might expect when reading.
 
 The following polars types **error** when writing and must be cast first:
 
-| Polars Type   | Cast To                    |
-| ------------- | -------------------------- |
-| `Int8`        | `Int32`                    |
-| `Int16`       | `Int32`                    |
-| `UInt8`       | `Int32`                    |
-| `UInt16`      | `Int32`                    |
-| `UInt32`      | `Int64`                    |
-| `UInt64`      | `Int64` (lossy for > 2⁶³)  |
-| `Time`        | `Int64`                    |
-| `Categorical` | `Int32` or `String`        |
-| `Enum`        | `Int32` or `String`        |
+| Polars Type    | Cast To                    |
+| -------------- | -------------------------- |
+| large `UInt64` | Wrap to `Int64`            |
+| `Categorical`  | `Int32` or `String`        |
+| `Enum`         | `Int32` or `String`        |
+
+Times will get truncated to micro seconds.
 
 Compression is supported via feature flags: `deflate`, `snappy`, `bzip2`, `xz`,
 `zstd`.
