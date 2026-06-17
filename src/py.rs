@@ -6,7 +6,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStoreExt, PutPayload};
 use polars::prelude::{PlSmallStr, Schema};
 use polars_io::cloud::{CloudOptions, PolarsObjectStore, build_object_store};
-use polars_io::pl_async::get_runtime;
+use polars_core::runtime::ASYNC;
 use polars_utils::pl_path::CloudScheme;
 use pyo3::exceptions::{PyException, PyIOError, PyIndexError, PyKeyError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
@@ -34,7 +34,7 @@ impl CloudReader {
         url: impl AsRef<str>,
         storage_options: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<Self, Error> {
-        get_runtime().block_on(async {
+        ASYNC.block_on(async {
             let options = if storage_options.is_empty() {
                 None
             } else {
@@ -75,7 +75,7 @@ impl Read for CloudReader {
             io::Error::new(io::ErrorKind::InvalidData, "read too long for a usize")
         })?);
         let range = pos..end;
-        let data = get_runtime()
+        let data = ASYNC
             .block_on(self.store.get_range(&self.path, range))
             .map_err(io::Error::other)?;
         let n = data.len();
@@ -132,7 +132,7 @@ impl CloudWriter {
         url: impl AsRef<str>,
         storage_options: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<Self, Error> {
-        get_runtime().block_on(async {
+        ASYNC.block_on(async {
             let options = if storage_options.is_empty() {
                 None
             } else {
@@ -154,7 +154,7 @@ impl CloudWriter {
 
 impl Write for CloudWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        get_runtime()
+        ASYNC
             .block_on(async {
                 let store = self.store.to_dyn_object_store().await;
                 store.put(&self.path, PutPayload::from(buf.to_vec())).await
@@ -349,7 +349,7 @@ impl Seek for PyIO {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct AvroSource {
     paths: Arc<[String]>,
@@ -439,7 +439,7 @@ impl AvroSource {
     }
 }
 
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
     Null,

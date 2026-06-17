@@ -132,7 +132,7 @@ where
         loop {
             match self.source.next() {
                 Some(Ok(batch)) if self.matched_schema(&batch) => {
-                    return Some(ffi::recordbatch_to_dataframe(&batch));
+                    return Some(Ok(ffi::recordbatch_to_dataframe(&batch)));
                 }
                 Some(Ok(batch)) => {
                     return Some(Err(Error::NonMatchingSchemas {
@@ -291,6 +291,235 @@ mod tests {
         .unwrap();
         let frame = read_scan(batches);
         assert_eq!(frame.get_column_names(), columns);
+    }
+
+    /// A non-first source that fails surfaces as an error item during iteration.
+    #[test]
+    fn test_source_error_propagates() {
+        let valid = write_avro("col", Schema::Int, [1, 2, 3]).unwrap();
+        let sources: Vec<Result<Cursor<Vec<u8>>, std::io::Error>> =
+            vec![Ok(valid), Err(std::io::Error::other("boom"))];
+        let mut reader = Reader::try_new(sources, FullReadOptions::default()).unwrap();
+        let last = reader.by_ref().last().unwrap();
+        assert!(matches!(last, Err(Error::IO(_, _))));
+    }
+
+    /// Serves a valid avro stream until `fail_at`, then returns a single I/O
+    /// error followed by EOF, so the reader errors once and then stops.
+    struct FailOnceReader {
+        data: Cursor<Vec<u8>>,
+        fail_at: u64,
+        failed: bool,
+    }
+
+    impl Read for FailOnceReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let pos = self.data.position();
+            if pos >= self.fail_at {
+                if self.failed {
+                    return Ok(0);
+                }
+                self.failed = true;
+                return Err(std::io::Error::other("boom"));
+            }
+            let remaining = usize::try_from(self.fail_at - pos).unwrap_or(usize::MAX);
+            let limit = remaining.min(buf.len());
+            self.data.read(&mut buf[..limit])
+        }
+    }
+
+    impl Seek for FailOnceReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.data.seek(pos)
+        }
+    }
+
+    /// An I/O error raised by the underlying reader mid-stream is surfaced as an
+    /// error item. The file is larger than the `BufReader` buffer so the header
+    /// is read up front (letting construction succeed) while the failure lands
+    /// on a later block read.
+    #[test]
+    fn test_reader_error_propagates() {
+        let bytes = write_avro("col", Schema::Int, 0..20_000)
+            .unwrap()
+            .into_inner();
+        assert!(bytes.len() > 8192, "need a multi-buffer file");
+        let source = FailOnceReader {
+            fail_at: u64::try_from(bytes.len()).unwrap() / 2,
+            data: Cursor::new(bytes),
+            failed: false,
+        };
+        let mut reader = Reader::try_new(
+            [ok(source)],
+            ReadOptions {
+                batch_size: 2,
+                ..FullReadOptions::default()
+            },
+        )
+        .unwrap();
+        // read up to (and including) the first error, then stop
+        let err = reader
+            .find(Result::is_err)
+            .expect("expected an error item")
+            .unwrap_err();
+        assert!(matches!(err, Error::Arrow(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_empty_sources_error() {
+        let sources: Vec<Result<Cursor<Vec<u8>>, std::io::Error>> = Vec::new();
+        let err = Reader::try_new(sources, FullReadOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::EmptySources));
+    }
+
+    #[test]
+    fn test_first_source_error() {
+        let sources: Vec<Result<Cursor<Vec<u8>>, std::io::Error>> =
+            vec![Err(std::io::Error::other("boom"))];
+        let err = Reader::try_new(sources, FullReadOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::IO(_, _)));
+    }
+
+    #[test]
+    fn test_projection_bad_header_error() {
+        let err = Reader::try_new(
+            [ok(Cursor::new(b"not an avro file".to_vec()))],
+            ReadOptions {
+                projection: Some(&["x"][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Avro(_) | Error::Arrow(_) | Error::ArrowAvro(_)),
+            "{err:?}"
+        );
+    }
+
+    /// Serves valid data but fails after `ok_seeks` successful seeks, to exercise
+    /// the seek error paths in the projection branch of `create_reader`.
+    #[derive(Debug)]
+    struct FailSeekAfter {
+        data: Cursor<Vec<u8>>,
+        ok_seeks: usize,
+    }
+
+    impl Read for FailSeekAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl Seek for FailSeekAfter {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            if self.ok_seeks == 0 {
+                return Err(std::io::Error::other("no seek"));
+            }
+            self.ok_seeks -= 1;
+            self.data.seek(pos)
+        }
+    }
+
+    fn projection_with_seeks(ok_seeks: usize) -> Error {
+        let valid = write_avro("col", Schema::Int, [1, 2, 3]).unwrap().into_inner();
+        Reader::try_new(
+            [ok(FailSeekAfter {
+                data: Cursor::new(valid),
+                ok_seeks,
+            })],
+            ReadOptions {
+                projection: Some(&["col"][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn test_projection_initial_seek_error() {
+        // fails on the first `stream_position`, before reading the schema
+        assert!(matches!(projection_with_seeks(0), Error::IO(_, _)));
+    }
+
+    #[test]
+    fn test_projection_rewind_seek_error() {
+        // fails on the second `stream_position`, after reading the schema
+        assert!(matches!(projection_with_seeks(1), Error::IO(_, _)));
+    }
+
+    /// Reports position 0 on the first `stream_position` and `u64::MAX` on the
+    /// second, so the header offset can't fit in an `i64`.
+    #[derive(Debug)]
+    struct HugePosReader {
+        data: Cursor<Vec<u8>>,
+        seeks: usize,
+    }
+
+    impl Read for HugePosReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl Seek for HugePosReader {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
+            if self.seeks == 1 { Ok(0) } else { Ok(u64::MAX) }
+        }
+    }
+
+    #[test]
+    fn test_large_header_error() {
+        let valid = write_avro("col", Schema::Int, [1, 2, 3]).unwrap().into_inner();
+        let err = Reader::try_new(
+            [ok(HugePosReader {
+                data: Cursor::new(valid),
+                seeks: 0,
+            })],
+            ReadOptions {
+                projection: Some(&["col"][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::LargeHeader), "{err:?}");
+    }
+
+    /// Allows `stream_position` (a `Current(0)` seek) but fails any real seek, so
+    /// the post-schema rewind fails once the header is too big to stay buffered.
+    #[derive(Debug)]
+    struct NoRelativeSeek(Cursor<Vec<u8>>);
+
+    impl Read for NoRelativeSeek {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Seek for NoRelativeSeek {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                std::io::SeekFrom::Current(0) => self.0.seek(pos),
+                _ => Err(std::io::Error::other("no relative seek")),
+            }
+        }
+    }
+
+    #[test]
+    fn test_projection_large_header_rewind_error() {
+        // a long field name makes the header exceed the 8 KiB BufReader buffer
+        let name = "f".repeat(9000);
+        let valid = write_avro(&name, Schema::Int, [1, 2, 3]).unwrap().into_inner();
+        assert!(valid.len() > 8192, "header should exceed the buffer");
+        let err = Reader::try_new(
+            [ok(NoRelativeSeek(Cursor::new(valid)))],
+            ReadOptions {
+                projection: Some(&[name.as_str()][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::IO(_, _)), "{err:?}");
     }
 
     macro_rules! test_read_type {
