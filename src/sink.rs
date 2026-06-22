@@ -27,7 +27,7 @@ impl<W: Write> Writer<W> {
         schema: &Schema,
         codec: Option<CompressionCodec>,
     ) -> Result<Self, Error> {
-        let schema = ffi::polars_schema_to_arrow(schema)?;
+        let schema = ffi::polars_schema_to_arrow(schema);
         let base: AvroWriter<_> = WriterBuilder::new(schema.clone())
             .with_compression(codec)
             .build(writer)?;
@@ -48,7 +48,7 @@ impl<W: Write> Writer<W> {
     /// # Errors
     /// If there were problems writing the batch, or the frame doesn't match the schema
     pub fn write(&mut self, batch: &DataFrame) -> Result<(), Error> {
-        let batch = ffi::dataframe_to_recordbatch(batch)?;
+        let batch = ffi::dataframe_to_recordbatch(batch);
         if *batch.schema() == self.schema {
             Ok(self.base.write(&batch)?)
         } else {
@@ -100,6 +100,19 @@ mod tests {
         mem::drop(Writer::try_new(&mut dest, ex.schema(), None).unwrap());
         let written = dest.len();
         assert_ne!(written, 0);
+    }
+
+    #[test]
+    fn test_into_inner() {
+        let batch = df! {
+            "col" => [1, 2, 3],
+        }
+        .unwrap();
+        let mut writer = Writer::try_new(Vec::new(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        let buff = writer.into_inner().unwrap();
+        let rows = Reader::new(&*buff).unwrap().count();
+        assert_eq!(rows, 3);
     }
 
     #[test]
@@ -188,7 +201,7 @@ mod tests {
             panic!("expected time");
         };
         // truncated to remove nanos
-        assert_eq!(val, 3723001002);
+        assert_eq!(val, 3_723_001_002);
     }
 
     #[test]
@@ -288,5 +301,65 @@ mod tests {
             .write(&batch)
             .unwrap_err();
         assert!(matches!(err, Error::ArrowAvro(_)));
+    }
+
+    /// A writer that can fail on writes or on flush, to exercise the I/O error
+    /// paths in `try_new` (header write) and `into_inner` (finish flushes).
+    #[derive(Debug)]
+    struct FailingWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::other("disk full"));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::other("disk full"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_build_io_error() {
+        let batch = df! { "col" => [1, 2, 3] }.unwrap();
+        // the writer fails on the very first write (the avro header)
+        let result = Writer::try_new(
+            FailingWriter {
+                fail_write: true,
+                fail_flush: false,
+            },
+            batch.schema(),
+            None,
+        );
+        let Err(err) = result else {
+            panic!("expected build to fail");
+        };
+        assert!(matches!(err, Error::ArrowAvro(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_finish_io_error() {
+        let batch = df! { "col" => [1, 2, 3] }.unwrap();
+        // header and data write fine; finishing flushes and fails
+        let mut writer = Writer::try_new(
+            FailingWriter {
+                fail_write: false,
+                fail_flush: true,
+            },
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        let err = writer.into_inner().unwrap_err();
+        assert!(matches!(err, Error::ArrowAvro(_)), "{err:?}");
     }
 }

@@ -150,8 +150,10 @@ mod tests {
     use super::Error;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::error::ArrowError;
+    use arrow_avro::errors::AvroError as ArrowAvroError;
     use polars::error::PolarsError;
     use polars::prelude::DataType;
+    use std::io;
     use std::sync::Arc;
 
     #[test]
@@ -166,17 +168,48 @@ mod tests {
             Field::new("changed", ArrowDataType::Utf8, false),
             Field::new("added", ArrowDataType::Boolean, false),
         ]));
+        let avro_err = apache_avro::Schema::parse_str("not a schema").unwrap_err();
         for err in [
             Error::Polars(PolarsError::NoData("test".into())),
             Error::Arrow(ArrowError::NotYetImplemented("test".into())),
+            Error::ArrowAvro(ArrowAvroError::General("test".into())),
+            Error::Avro(avro_err),
             Error::EmptySources,
             Error::NonRecordSchema,
             Error::UnsupportedPolarsType(DataType::Null),
             Error::NullEnum,
+            Error::LargeHeader,
             Error::NonMatchingSchemas { expected, actual },
+            Error::ColumnNotFound("missing".into()),
+            Error::ColumnIndexOutOfBounds(7),
+            Error::IO(io::Error::other("boom"), "path".into()),
         ] {
             assert!(!format!("{err}").is_empty());
         }
+    }
+
+    #[test]
+    fn test_from_conversions() {
+        assert!(matches!(
+            Error::from(ArrowError::NotYetImplemented("test".into())),
+            Error::Arrow(_)
+        ));
+        assert!(matches!(
+            Error::from(ArrowAvroError::General("test".into())),
+            Error::ArrowAvro(_)
+        ));
+        assert!(matches!(
+            Error::from(apache_avro::Schema::parse_str("not a schema").unwrap_err()),
+            Error::Avro(_)
+        ));
+        assert!(matches!(
+            Error::from(PolarsError::NoData("test".into())),
+            Error::Polars(_)
+        ));
+        assert!(matches!(
+            Error::from(io::Error::other("boom")),
+            Error::IO(_, _)
+        ));
     }
 
     #[test]
@@ -196,5 +229,59 @@ mod tests {
         assert!(msg.contains("added \"added\""), "{msg}");
         assert!(msg.contains("\"changed\": expected"), "{msg}");
         assert!(!msg.contains("\"kept\""), "{msg}");
+    }
+
+    /// A `fmt::Write` that fails as soon as it sees a marker substring, used to
+    /// drive the writer-error paths inside `Display`.
+    struct FailOn(&'static str);
+
+    impl std::fmt::Write for FailOn {
+        fn write_str(&mut self, segment: &str) -> std::fmt::Result {
+            if segment.contains(self.0) {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_matching_write_errors() {
+        use std::fmt::Write as _;
+
+        // failing while writing a removed field propagates the error
+        let expected = Schema::new(vec![Field::new("gone", ArrowDataType::Int32, false)]);
+        let actual = Arc::new(Schema::new(Vec::<Field>::new()));
+        let removed = Error::NonMatchingSchemas { expected, actual };
+        assert!(write!(FailOn("removed"), "{removed}").is_err());
+
+        // failing while writing a changed field propagates the error
+        let expected = Schema::new(vec![Field::new("col", ArrowDataType::Int32, false)]);
+        let actual = Arc::new(Schema::new(vec![Field::new(
+            "col",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let changed = Error::NonMatchingSchemas { expected, actual };
+        assert!(write!(FailOn("expected"), "{changed}").is_err());
+
+        // failing on the leading "schemas differ:" write propagates the error
+        let expected = Schema::new(vec![Field::new("col", ArrowDataType::Int32, false)]);
+        let actual = Arc::new(Schema::new(vec![Field::new(
+            "col",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let same = Error::NonMatchingSchemas { expected, actual };
+        assert!(write!(FailOn("schemas"), "{same}").is_err());
+
+        // failing while writing an added field propagates the error
+        let expected = Schema::new(vec![Field::new("col", ArrowDataType::Int32, false)]);
+        let actual = Arc::new(Schema::new(vec![
+            Field::new("col", ArrowDataType::Int32, false),
+            Field::new("extra", ArrowDataType::Int32, false),
+        ]));
+        let added = Error::NonMatchingSchemas { expected, actual };
+        assert!(write!(FailOn("added"), "{added}").is_err());
     }
 }
