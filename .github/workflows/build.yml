@@ -32,12 +32,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install uv
           rustup component add --toolchain nightly clippy
+          rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Check rust format
         run: cargo fmt --check
       - name: Check rust style
         run: cargo clippy --all-features --tests
-      - name: Run rust tests
-        run: cargo test
+      - name: Run rust tests with coverage
+        run: cargo llvm-cov
       - name: Check ruff format
         run: uv run ruff format --check
       - name: Check with ruff
