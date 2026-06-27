@@ -1,15 +1,22 @@
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from glob import iglob
 from os import path
 from pathlib import Path
 from typing import BinaryIO
 
 import polars as pl
+import pyarrow as pa
 from polars import DataFrame, Expr, LazyFrame
 from polars.io.plugins import register_io_source
 
 from ._avro_rs import AvroSource
-from ._cloud import CredentialProviderInput, resolve_credentials
+
+
+def _arrow_to_frame(data: pa.Table | pa.RecordBatch) -> DataFrame:
+    """Import a pyarrow table or record batch as a DataFrame."""
+    frame = pl.from_arrow(data)
+    assert isinstance(frame, DataFrame)
+    return frame
 
 
 def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
@@ -23,21 +30,21 @@ def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
         yield expanded
 
 
-def scan_avro(  # noqa: PLR0913
+def scan_avro(
     sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
     *,
     batch_size: int = 1024,
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
-    storage_options: Mapping[str, str] | None = None,
-    credential_provider: CredentialProviderInput = "auto",
 ) -> LazyFrame:
     """Scan Avro files.
 
     Parameters
     ----------
-    sources : The source(s) to scan.
+    sources : The source(s) to scan. Local file paths or readable binary
+        buffers. Binary buffers must be seekable (support ``seek``/``tell``);
+        the reader rewinds them to read headers and to rewind for projection.
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files.
     strict : Whether to use strict mode when parsing avro. Incurs a
@@ -47,11 +54,6 @@ def scan_avro(  # noqa: PLR0913
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
-    storage_options : Extra configuration passed to the cloud storage
-        backend (same keys accepted by Polars, e.g. ``aws_region``).
-    credential_provider : Credential provider for cloud storage. Set to
-        ``"auto"`` (default) to use automatic credential detection, or
-        ``None`` to disable.
     """
     # normalize sources
     strs: list[str] = []
@@ -68,15 +70,12 @@ def scan_avro(  # noqa: PLR0913
         case _:
             bins.append(sources)
 
-    # resolve credentials
-    options = resolve_credentials(credential_provider, strs, storage_options)
-
     def_batch_size = batch_size
 
-    src = AvroSource(strs, bins, options)
+    src = AvroSource(strs, bins)
 
     def get_schema() -> pl.Schema:
-        return pl.Schema(src.schema())
+        return _arrow_to_frame(src.schema().empty_table()).schema
 
     def source_generator(
         with_columns: list[str] | None,
@@ -87,9 +86,12 @@ def scan_avro(  # noqa: PLR0913
         avro_iter = src.batch_iter(
             strict, utf8_view, batch_size or def_batch_size, with_columns
         )
-        while (batch := avro_iter.next()) is not None:
+        for arrow_batch in avro_iter:
+            batch = _arrow_to_frame(arrow_batch)
             if predicate is not None:
-                batch = batch.filter(predicate)  # type: ignore
+                # importing the typed native module confuses pyright's view of
+                # DataFrame.filter here; the call is correct at runtime
+                batch = batch.filter(predicate)  # type: ignore[reportUnknownMemberType]
             if n_rows is None:
                 yield batch
             else:
@@ -99,7 +101,9 @@ def scan_avro(  # noqa: PLR0913
                 if n_rows == 0:
                     break
 
-    return register_io_source(source_generator, schema=get_schema)
+    # type errors with callable schema
+    # https://github.com/pola-rs/polars/issues/22182
+    return register_io_source(source_generator, schema=get_schema)  # type: ignore[reportArgumentType]
 
 
 def read_avro(  # noqa: PLR0913
@@ -114,14 +118,14 @@ def read_avro(  # noqa: PLR0913
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
-    storage_options: Mapping[str, str] | None = None,
-    credential_provider: CredentialProviderInput = "auto",
 ) -> DataFrame:
     """Read an Avro file into a DataFrame.
 
     Parameters
     ----------
-    sources : The source(s) to scan.
+    sources : The source(s) to scan. Local file paths or readable binary
+        buffers. Binary buffers must be seekable (support ``seek``/``tell``);
+        the reader rewinds them to read headers and to rewind for projection.
     columns : The columns to select.
     n_rows : The number of rows to read.
     row_index_name : The name of the row index column, or None to not add one.
@@ -136,11 +140,6 @@ def read_avro(  # noqa: PLR0913
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
-    storage_options : Extra configuration passed to the cloud storage
-        backend (same keys accepted by Polars, e.g. ``aws_region``).
-    credential_provider : Credential provider for cloud storage. Set to
-        ``"auto"`` (default) to use automatic credential detection, or
-        ``None`` to disable.
     """
     lazy = scan_avro(
         sources,
@@ -148,11 +147,11 @@ def read_avro(  # noqa: PLR0913
         glob=glob,
         strict=strict,
         utf8_view=utf8_view,
-        storage_options=storage_options,
-        credential_provider=credential_provider,
     )
     if columns is not None:
-        lazy = lazy.select(  # type: ignore
+        # see the filter note in scan_avro: the native import perturbs pyright's
+        # view of LazyFrame.select; correct at runtime
+        lazy = lazy.select(  # type: ignore[reportUnknownMemberType]
             [pl.nth(c) if isinstance(c, int) else pl.col(c) for c in columns]
         )
     if row_index_name is not None:

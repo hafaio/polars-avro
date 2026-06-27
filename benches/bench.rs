@@ -2,182 +2,99 @@
 
 extern crate test;
 
-use polars::prelude::{self as pl, Column, DataFrame, IntoLazy, Series, df};
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringArray,
+};
+use arrow::datatypes::{Field, Schema};
 use polars_avro::{FullReadOptions, ReadOptions, Reader, Writer};
-use polars_io::avro::{AvroReader, AvroWriter};
-use polars_io::{SerReader, SerWriter};
 use std::convert::Infallible;
 use std::io::Cursor;
+use std::sync::Arc;
 use test::Bencher;
 
-fn create_narrow_frame(n: i32) -> DataFrame {
-    df!(
-        "idx" => Vec::from_iter(0..n),
-        "name" => Vec::from_iter((0..n).map(|v| v.to_string())),
-    )
+fn create_narrow_frame(n: i32) -> RecordBatch {
+    RecordBatch::try_from_iter([
+        (
+            "idx",
+            Arc::new(Int32Array::from_iter_values(0..n)) as ArrayRef,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from_iter_values((0..n).map(|v| v.to_string()))) as ArrayRef,
+        ),
+    ])
     .unwrap()
 }
 
-fn create_wide_frame(n: i32) -> DataFrame {
-    df!(
-        "i32_col" => Vec::from_iter(0..n),
-        "i64_col" => Vec::from_iter((0..n).map(|v| v as i64 * 1000)),
-        "f64_col" => Vec::from_iter((0..n).map(|v| v as f64 * 0.01)),
-        "f32_col" => Vec::from_iter((0..n).map(|v| v as f32 * 0.1)),
-        "bool_col" => Vec::from_iter((0..n).map(|v| v % 2 == 0)),
-        "str_col" => Vec::from_iter((0..n).map(|v| format!("val_{v}"))),
-        "binary_col" => Vec::from_iter((0..n).map(|v| format!("bin_{v}").into_bytes())),
-        "str2_col" => Vec::from_iter((0..n).map(|v| format!("extra_{v}"))),
-    )
+fn create_wide_frame(n: i32) -> RecordBatch {
+    RecordBatch::try_from_iter([
+        (
+            "i32_col",
+            Arc::new(Int32Array::from_iter_values(0..n)) as ArrayRef,
+        ),
+        (
+            "i64_col",
+            Arc::new(Int64Array::from_iter_values(
+                (0..n).map(|v| i64::from(v) * 1000),
+            )) as ArrayRef,
+        ),
+        (
+            "f64_col",
+            Arc::new(Float64Array::from_iter_values(
+                (0..n).map(|v| f64::from(v) * 0.01),
+            )) as ArrayRef,
+        ),
+        (
+            "f32_col",
+            Arc::new(Float32Array::from_iter_values(
+                (0..n).map(|v| v as f32 * 0.1),
+            )) as ArrayRef,
+        ),
+        (
+            "bool_col",
+            Arc::new(BooleanArray::from_iter((0..n).map(|v| Some(v % 2 == 0)))) as ArrayRef,
+        ),
+        (
+            "str_col",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|v| format!("val_{v}")),
+            )) as ArrayRef,
+        ),
+        (
+            "binary_col",
+            Arc::new(BinaryArray::from_iter_values(
+                (0..n).map(|v| format!("bin_{v}").into_bytes()),
+            )) as ArrayRef,
+        ),
+        (
+            "str2_col",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|v| format!("extra_{v}")),
+            )) as ArrayRef,
+        ),
+    ])
     .unwrap()
 }
 
-fn create_nested_frame(n: i32) -> DataFrame {
-    df!(
-        "idx" => Vec::from_iter(0..n),
-        "name" => Vec::from_iter((0..n).map(|v| format!("name_{v}"))),
-        "score" => Vec::from_iter((0..n).map(|v| v as f64 * 1.5)),
-        "active" => Vec::from_iter((0..n).map(|v| v % 2 == 0)),
-        "tags" => Vec::from_iter((0..n).map(|v| {
-            Series::from_iter((0..v % 4).map(|t| format!("tag_{t}")))
-        })),
-        "rating" => Vec::from_iter((0..n).map(|v| if v % 3 == 0 { "good" } else if v % 3 == 1 { "mid" } else { "bad" })),
-        "notes" => Vec::from_iter((0..n).map(|v| format!("note_{v}"))),
-    )
-    .unwrap()
-    .lazy()
-    .with_column(
-        pl::as_struct(vec![
-            pl::col("name"),
-            pl::as_struct(vec![
-                pl::col("tags"),
-                pl::col("score")
-            ])
-        ]).alias("info"),
-    )
-    .collect()
-    .unwrap()
-}
-
-fn create_mega_wide_frame(n: i32) -> DataFrame {
+fn create_mega_wide_frame(n: i32) -> RecordBatch {
     let base = create_wide_frame(n);
-    let mut columns: Vec<Column> = Vec::with_capacity(base.width() * 16);
-    for g in 0..16 {
-        for series in base.materialized_column_iter() {
-            let mut s = series.clone();
-            s.rename(format!("{}_{g}", series.name()).into());
-            columns.push(s.into());
+    let mut fields = Vec::with_capacity(base.num_columns() * 16);
+    let mut arrays = Vec::with_capacity(base.num_columns() * 16);
+    for group in 0..16 {
+        for (field, array) in base.schema().fields().iter().zip(base.columns()) {
+            fields.push(Field::new(
+                format!("{}_{group}", field.name()),
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
+            arrays.push(array.clone());
         }
     }
-    DataFrame::new(n as usize, columns).unwrap()
-}
-
-fn create_complex_frame(n: i32) -> DataFrame {
-    df!(
-        "idx" => Vec::from_iter(0..n),
-        "name" => Vec::from_iter((0..n).map(|v| format!("name_{v}"))),
-        "score" => Vec::from_iter((0..n).map(|v| v as f64 * 1.5)),
-        "active" => Vec::from_iter((0..n).map(|v| v % 2 == 0)),
-        "tags" => Vec::from_iter((0..n).map(|v| {
-            Series::from_iter((0..v % 5).map(|t| format!("tag_{t}")))
-        })),
-        "key" => Vec::from_iter((0..n).map(|v| format!("key_{v}"))),
-        "value" => Vec::from_iter(0..n),
-        "created_i32" => Vec::from_iter(0..n),
-        "notes" => Vec::from_iter((0..n).map(|v| format!("note_{v}"))),
-    )
-    .unwrap()
-    .lazy()
-    .with_columns([
-        pl::as_struct(vec![pl::col("key"), pl::col("value")]).alias("metadata"),
-        pl::col("created_i32")
-            .cast(pl::DataType::Date)
-            .alias("created"),
-    ])
-    .select([
-        pl::col("idx"),
-        pl::col("name"),
-        pl::col("score"),
-        pl::col("active"),
-        pl::col("tags"),
-        pl::col("metadata"),
-        pl::col("created"),
-        pl::col("notes"),
-    ])
-    .collect()
-    .unwrap()
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
 macro_rules! bench_shape {
-    ($name:ident, $frame_expr:expr) => {
-        mod $name {
-            use super::*;
-
-            #[bench]
-            fn write_polars_avro(b: &mut Bencher) {
-                let frame = $frame_expr;
-                b.iter(|| {
-                    test::black_box(
-                        Writer::try_new(Vec::new(), frame.schema(), None)
-                            .unwrap()
-                            .write(&frame)
-                            .unwrap(),
-                    )
-                });
-            }
-
-            #[bench]
-            fn write_polars_native(b: &mut Bencher) {
-                let frame = $frame_expr;
-                b.iter(|| {
-                    test::black_box(
-                        AvroWriter::new(Vec::new())
-                            .with_name("".to_owned())
-                            .finish(&mut frame.clone())
-                            .unwrap(),
-                    )
-                });
-            }
-
-            #[bench]
-            fn read_polars_avro(b: &mut Bencher) {
-                let frame = $frame_expr;
-                let mut buff = Cursor::new(Vec::new());
-                Writer::try_new(&mut buff, frame.schema(), None)
-                    .unwrap()
-                    .write(&frame)
-                    .unwrap();
-                b.iter(move || {
-                    buff.set_position(0);
-                    test::black_box(
-                        Reader::try_new(
-                            [Ok::<_, Infallible>(&mut buff)],
-                            FullReadOptions::default(),
-                        )
-                        .unwrap()
-                        .collect::<Vec<_>>(),
-                    )
-                });
-            }
-
-            #[bench]
-            fn read_polars_native(b: &mut Bencher) {
-                let frame = $frame_expr;
-                let mut buff = Cursor::new(Vec::new());
-                Writer::try_new(&mut buff, frame.schema(), None)
-                    .unwrap()
-                    .write(&frame)
-                    .unwrap();
-                b.iter(move || {
-                    buff.set_position(0);
-                    test::black_box(AvroReader::new(&mut buff).finish().unwrap());
-                });
-            }
-        }
-    };
-}
-
-macro_rules! bench_shape_avro_only {
     ($name:ident, $frame_expr:expr) => {
         mod $name {
             use super::*;
@@ -248,26 +165,6 @@ macro_rules! bench_projection {
                     )
                 });
             }
-
-            #[bench]
-            fn read_polars_native(b: &mut Bencher) {
-                let frame = $frame_expr;
-                let mut buff = Cursor::new(Vec::new());
-                Writer::try_new(&mut buff, frame.schema(), None)
-                    .unwrap()
-                    .write(&frame)
-                    .unwrap();
-                let columns: Vec<String> = vec![$($col.to_owned()),+];
-                b.iter(move || {
-                    buff.set_position(0);
-                    test::black_box(
-                        AvroReader::new(&mut buff)
-                            .with_columns(Some(columns.clone()))
-                            .finish()
-                            .unwrap(),
-                    )
-                });
-            }
         }
     };
 }
@@ -310,8 +207,6 @@ bench_shape!(narrow_long, create_narrow_frame(65536));
 bench_shape!(wide, create_wide_frame(1024));
 bench_shape!(large, create_wide_frame(1_048_576));
 bench_shape!(mega_wide, create_mega_wide_frame(1_048_576));
-bench_shape_avro_only!(nested, create_nested_frame(1024));
-bench_shape_avro_only!(complex, create_complex_frame(1_048_576));
 
 bench_read_options!(narrow_medium_strict, create_narrow_frame(1024), strict: true);
 bench_read_options!(narrow_medium_utf8_view, create_narrow_frame(1024), utf8_view: true);
