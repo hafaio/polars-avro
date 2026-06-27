@@ -1,22 +1,20 @@
 use super::Error;
-use super::ffi;
 use apache_avro::schema::{RecordSchema, Schema as ApacheSchema};
+use arrow::datatypes::SchemaRef;
 use arrow_avro::reader::ReaderBuilder;
-use polars::prelude::Schema as PlSchema;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io::BufRead;
 use std::ops::Deref;
 use std::sync::Arc;
 
-/// Get a polars schema from an avro reader
+/// Get an arrow schema from an avro reader
 ///
 /// # Errors
-/// If the avro schema can't be converted into a polars schema, or any errors
-/// from the reader
-pub fn get_schema<R: BufRead>(reader: R) -> Result<PlSchema, Error> {
+/// If the avro schema can't be read, or any errors from the reader
+pub fn get_schema<R: BufRead>(reader: R) -> Result<SchemaRef, Error> {
     let reader = ReaderBuilder::new().build(reader)?;
-    Ok(ffi::arrow_schema_to_polars(reader.schema().as_ref()))
+    Ok(reader.schema())
 }
 
 /// Something that can be used to project a schema

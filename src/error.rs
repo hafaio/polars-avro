@@ -4,8 +4,6 @@ use apache_avro::Error as AvroError;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use arrow_avro::errors::AvroError as ArrowAvroError;
-use polars::error::PolarsError;
-use polars::prelude::DataType;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error as StdError;
@@ -17,8 +15,6 @@ use std::sync::Arc;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
-    /// An error from polars
-    Polars(PolarsError),
     /// An error from the arrow library
     Arrow(ArrowError),
     /// An error from the arrow-avro library
@@ -29,13 +25,6 @@ pub enum Error {
     EmptySources,
     /// Top level avro schema must be a record
     NonRecordSchema,
-    /// Avro and arrow don't share the same types and this type can't be converted
-    ///
-    /// There are options for sink that allow promotion or truncation that alter
-    /// what types can be serialized
-    UnsupportedPolarsType(DataType),
-    /// Polars allows unspecified enums, but avro does not
-    NullEnum,
     /// Happens when an avro header doesn't fit in an i64
     LargeHeader,
     /// If not all schemas in a batch were identical
@@ -56,17 +45,11 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Error::Polars(e) => write!(f, "Error from polars: {e}"),
             Error::Arrow(e) => write!(f, "Error from arrow: {e}"),
             Error::ArrowAvro(e) => write!(f, "Error from arrow-avro: {e}"),
             Error::Avro(e) => write!(f, "Error from avro: {e}"),
             Error::EmptySources => write!(f, "Cannot scan empty sources"),
             Error::NonRecordSchema => write!(f, "Top level avro schema must be a record"),
-            Error::UnsupportedPolarsType(dtype) => write!(
-                f,
-                "Avro and arrow don't share the same types, this polars type can't be converted: {dtype}",
-            ),
-            Error::NullEnum => write!(f, "Polars allows unspecified enums, but avro does not"),
             Error::LargeHeader => write!(f, "Avro header is too large"),
             Error::NonMatchingSchemas { expected, actual } => {
                 write!(f, "schemas differ:")?;
@@ -127,12 +110,6 @@ impl From<AvroError> for Error {
     }
 }
 
-impl From<PolarsError> for Error {
-    fn from(value: PolarsError) -> Self {
-        Self::Polars(value)
-    }
-}
-
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::IO(value, "io".into())
@@ -151,8 +128,6 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::error::ArrowError;
     use arrow_avro::errors::AvroError as ArrowAvroError;
-    use polars::error::PolarsError;
-    use polars::prelude::DataType;
     use std::io;
     use std::sync::Arc;
 
@@ -170,14 +145,11 @@ mod tests {
         ]));
         let avro_err = apache_avro::Schema::parse_str("not a schema").unwrap_err();
         for err in [
-            Error::Polars(PolarsError::NoData("test".into())),
             Error::Arrow(ArrowError::NotYetImplemented("test".into())),
             Error::ArrowAvro(ArrowAvroError::General("test".into())),
             Error::Avro(avro_err),
             Error::EmptySources,
             Error::NonRecordSchema,
-            Error::UnsupportedPolarsType(DataType::Null),
-            Error::NullEnum,
             Error::LargeHeader,
             Error::NonMatchingSchemas { expected, actual },
             Error::ColumnNotFound("missing".into()),
@@ -201,10 +173,6 @@ mod tests {
         assert!(matches!(
             Error::from(apache_avro::Schema::parse_str("not a schema").unwrap_err()),
             Error::Avro(_)
-        ));
-        assert!(matches!(
-            Error::from(PolarsError::NoData("test".into())),
-            Error::Polars(_)
         ));
         assert!(matches!(
             Error::from(io::Error::other("boom")),

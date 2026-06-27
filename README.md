@@ -154,10 +154,13 @@ uv run pytest
 
 ### Benchmarking
 
-Python benchmarks are disabled by default. To run them:
+Benchmarks must run against an **optimized** build. `maturin develop` (used for
+normal testing) compiles the extension unoptimized, which makes the Python
+benchmarks meaningless (~20x slower). Build release first:
 
 ```sh
 cargo +nightly bench
+uv run maturin develop --release
 uv run pytest --benchmark-only
 ```
 

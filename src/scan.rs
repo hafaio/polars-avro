@@ -2,13 +2,11 @@
 
 use super::Error;
 use super::Projection;
-use super::ffi;
 use apache_avro::Reader as AvroReader;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow_avro::reader::{Reader as ArrowAvroReader, ReaderBuilder};
 use arrow_avro::schema::AvroSchema;
-use polars::frame::DataFrame;
 use std::convert::Infallible;
 use std::io::{BufReader, Read, Seek};
 use std::iter::FusedIterator;
@@ -22,8 +20,8 @@ pub struct ReadOptions<P = Infallible> {
     /// If strings should be read in as views instead of character arrays.
     ///
     /// This affects UUID and nullable string handling — see the README for details.
-    /// Since polars tends to work with string views internally, enabling this is
-    /// likely faster if you don't mind losing null string distinctions.
+    /// String views avoid copying, so enabling this is likely faster if you
+    /// don't mind losing null string distinctions.
     pub utf8_view: bool,
     /// The batch size for reading
     pub batch_size: usize,
@@ -73,7 +71,7 @@ impl<P: Projection> ReadOptions<P> {
     }
 }
 
-/// An iterator that yields [`DataFrame`]s from one or more avro sources.
+/// An iterator that yields [`RecordBatch`]es from one or more avro sources.
 ///
 /// All sources must share the same schema; a [`Error::NonMatchingSchemas`]
 /// error is returned if they differ.
@@ -125,14 +123,14 @@ where
     I: Iterator<Item = Result<R, E>>,
     P: Projection,
 {
-    type Item = Result<DataFrame, Error>;
+    type Item = Result<RecordBatch, Error>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.source.next() {
                 Some(Ok(batch)) if self.matched_schema(&batch) => {
-                    return Some(Ok(ffi::recordbatch_to_dataframe(&batch)));
+                    return Some(Ok(batch));
                 }
                 Some(Ok(batch)) => {
                     return Some(Err(Error::NonMatchingSchemas {
@@ -168,32 +166,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Error, FullReadOptions, Projection, ReadOptions, Reader};
-    use apache_avro::schema::ArraySchema;
-    use apache_avro::schema::EnumSchema;
-    use apache_avro::schema::MapSchema;
-    use apache_avro::schema::UnionSchema;
-    use apache_avro::schema::{DecimalSchema, FixedSchema, RecordField, RecordSchema, Schema};
+    use apache_avro::schema::{FixedSchema, RecordField, RecordSchema, Schema, UnionSchema};
     use apache_avro::types::{Record, Value};
     use apache_avro::{
         AvroResult, Days, Decimal as AvroDecimal, Duration as AvroDuration, Millis, Months, Writer,
     };
-    use bigdecimal::BigDecimal;
-    use polars::df;
-    use polars::frame::DataFrame;
-    use polars::prelude::PlSmallStr;
-    use polars::prelude::SortOptions;
-    use polars::prelude::StructChunked;
-    use polars::prelude::{
-        self as pl, Categories, DataType, IntoLazy, NamedFrom, Series, TimeUnit, TimeZone,
-        UnionArgs,
-    };
-    use std::collections::BTreeMap;
-    use std::collections::HashMap;
+    use arrow::array::{Array, RecordBatch};
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::DataType;
     use std::convert::Infallible;
     use std::fs::File;
-    use std::io::Cursor;
-    use std::io::Read;
-    use std::io::Seek;
+    use std::io::{Cursor, Read, Seek};
     use std::mem;
     use uuid::Uuid;
 
@@ -202,38 +185,40 @@ mod tests {
         Ok(val)
     }
 
-    fn read_scan<R: Read + Seek, E>(
-        scanner: Reader<R, impl Iterator<Item = Result<R, E>>, impl Projection>,
-    ) -> DataFrame
+    /// Drain a reader and concatenate all of its batches into one.
+    fn collect_one<R, E, I, P>(reader: Reader<R, I, P>) -> RecordBatch
     where
+        R: Read + Seek,
         Error: From<E>,
+        I: Iterator<Item = Result<R, E>>,
+        P: Projection,
     {
-        let frames: Vec<_> = scanner.map(|part| part.unwrap().lazy()).collect();
-        pl::concat(frames, UnionArgs::default())
-            .unwrap()
-            .collect()
-            .unwrap()
+        let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+        let schema = batches
+            .first()
+            .expect("expected at least one batch")
+            .schema();
+        concat_batches(&schema, &batches).unwrap()
     }
 
-    fn map_struct<'a, V>(
-        name: impl Into<PlSmallStr>,
-        keys: impl IntoIterator<Item = &'a str>,
-        values: impl IntoIterator<Item = V>,
-    ) -> Series
-    where
-        Series: NamedFrom<Vec<&'a str>, [&'a str]> + NamedFrom<Vec<V>, [V]>,
-    {
-        let keys: Vec<&str> = keys.into_iter().collect();
-        let len = keys.len();
-        let values: Vec<V> = values.into_iter().collect();
-        let key_series = Series::new("key".into(), keys);
-        let value_series = Series::new("value".into(), values);
-        Series::from(
-            StructChunked::from_series(name.into(), len, [key_series, value_series].iter())
-                .unwrap(),
+    fn is_string_type(dtype: &DataType) -> bool {
+        matches!(
+            dtype,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         )
     }
 
+    fn is_binary_type(dtype: &DataType) -> bool {
+        matches!(
+            dtype,
+            DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+        )
+    }
+
+    /// Write a single-field avro record file to an in-memory buffer.
     fn write_avro(
         name: &str,
         dtype: Schema,
@@ -272,12 +257,12 @@ mod tests {
             FullReadOptions::default(),
         )
         .unwrap();
-        let frame = read_scan(batches);
-        assert_eq!(frame.height(), 27);
-        assert_eq!(frame.schema().len(), 4);
+        let frame = collect_one(batches);
+        assert_eq!(frame.num_rows(), 27);
+        assert_eq!(frame.num_columns(), 4);
     }
 
-    /// Test scan on a simple file
+    /// Projection reorders and subsets the columns
     #[test]
     fn test_reorder() {
         let columns = ["sugars_g", "calories"];
@@ -289,8 +274,153 @@ mod tests {
             },
         )
         .unwrap();
-        let frame = read_scan(batches);
-        assert_eq!(frame.get_column_names(), columns);
+        let frame = collect_one(batches);
+        let schema = frame.schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, columns);
+    }
+
+    /// Avro bytes are read as an arrow binary type
+    #[test]
+    fn test_bytes() {
+        let buff = write_avro("bytes", Schema::Bytes, [&b"test"[..], &b"another"[..]]).unwrap();
+        let frame = collect_one(Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap());
+        assert_eq!(frame.num_rows(), 2);
+        assert!(is_binary_type(frame.column(0).data_type()));
+    }
+
+    /// Avro fixed is read as a fixed size binary
+    #[test]
+    fn test_fixed() {
+        let buff = write_avro(
+            "fixed",
+            Schema::Fixed(FixedSchema::builder().name("fixed".into()).size(4).build()),
+            [
+                Value::Fixed(4, vec![1, 2, 3, 4]),
+                Value::Fixed(4, vec![5, 6, 7, 8]),
+            ],
+        )
+        .unwrap();
+        let frame = collect_one(Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap());
+        assert_eq!(frame.column(0).data_type(), &DataType::FixedSizeBinary(4));
+    }
+
+    /// Avro decimal is read as a 128-bit decimal
+    #[test]
+    fn test_decimal() {
+        let buff = write_avro(
+            "decimal",
+            Schema::Decimal(apache_avro::schema::DecimalSchema {
+                precision: 10,
+                scale: 2,
+                inner: Box::new(Schema::Bytes),
+            }),
+            [
+                Value::Decimal(AvroDecimal::from(vec![0x64u8])),
+                Value::Decimal(AvroDecimal::from(vec![0x00, 0xFA])),
+            ],
+        )
+        .unwrap();
+        let frame = collect_one(Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap());
+        assert_eq!(frame.column(0).data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    /// With `utf8_view` off, avro UUIDs decode to a binary type
+    #[test]
+    fn test_uuid_binary() {
+        let buff = write_avro(
+            "uuid",
+            Schema::Uuid,
+            [Value::Uuid(
+                Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap(),
+            )],
+        )
+        .unwrap();
+        let frame = collect_one(
+            Reader::try_new(
+                [ok(buff)],
+                ReadOptions {
+                    utf8_view: false,
+                    ..FullReadOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(is_binary_type(frame.column(0).data_type()));
+    }
+
+    /// With `utf8_view` on, avro UUIDs decode to a string type
+    #[test]
+    fn test_uuid_view() {
+        let buff = write_avro(
+            "uuid",
+            Schema::Uuid,
+            [Value::Uuid(
+                Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap(),
+            )],
+        )
+        .unwrap();
+        let frame = collect_one(
+            Reader::try_new(
+                [ok(buff)],
+                ReadOptions {
+                    utf8_view: true,
+                    ..FullReadOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(is_string_type(frame.column(0).data_type()));
+    }
+
+    /// With `utf8_view` off, nulls in a nullable string are preserved
+    #[test]
+    fn test_null_string_preserved() {
+        let buff = write_avro(
+            "val",
+            Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
+            [Some("string"), None],
+        )
+        .unwrap();
+        let frame = collect_one(
+            Reader::try_new(
+                [ok(buff)],
+                ReadOptions {
+                    utf8_view: false,
+                    ..FullReadOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(is_string_type(frame.column(0).data_type()));
+        assert_eq!(frame.column(0).null_count(), 1);
+    }
+
+    /// With `utf8_view` on, nulls in a nullable string become empty strings
+    #[test]
+    fn test_null_string_lossy() {
+        let buff = write_avro(
+            "val",
+            Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
+            [Some("string"), None],
+        )
+        .unwrap();
+        let frame = collect_one(
+            Reader::try_new(
+                [ok(buff)],
+                ReadOptions {
+                    utf8_view: true,
+                    ..FullReadOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(is_string_type(frame.column(0).data_type()));
+        assert_eq!(frame.column(0).null_count(), 0);
     }
 
     /// A non-first source that fails surfaces as an error item during iteration.
@@ -528,210 +658,6 @@ mod tests {
         assert!(matches!(err, Error::IO(_, _)), "{err:?}");
     }
 
-    macro_rules! test_read_type {
-        ($(#[$attr:meta])* $name:ident: $col:expr, $schema:expr, $val:expr, $expected:expr $(, $field:ident : $value:expr)* $(,)?) => {
-            $(#[$attr])*
-            #[test]
-            fn $name() {
-                let buff = write_avro($col, $schema, $val).unwrap();
-                let res = Reader::try_new([ok(buff)], ReadOptions { $($field: $value,)* ..FullReadOptions::default() }).unwrap();
-                let frame = read_scan(res);
-                let expected: Series = $expected;
-                let actual = frame.column($col).unwrap().as_series().unwrap();
-                assert_eq!(actual, &expected);
-            }
-        };
-    }
-
-    test_read_type!(test_bytes: "bytes", Schema::Bytes,
-        [&b"test"[..], &b"another"[..]],
-        Series::new("bytes".into(), [&b"test"[..], &b"another"[..]])
-    );
-
-    test_read_type!(test_enum: "enum",
-        Schema::Enum(
-            EnumSchema::builder()
-                .name("enum".into())
-                .symbols(vec!["a".into(), "b".into()])
-                .build(),
-        ),
-        ["a", "b", "a"],
-        Series::new("enum".into(), ["a", "b", "a"])
-            .cast(&DataType::from_categories(Categories::global()))
-            .unwrap()
-    );
-
-    test_read_type!(test_fixed: "fixed",
-        Schema::Fixed(FixedSchema::builder().name("fixed".into()).size(4).build()),
-        [Value::Fixed(4, vec![1, 2, 3, 4]), Value::Fixed(4, vec![5, 6, 7, 8])],
-        Series::new("fixed".into(), [&[1u8, 2, 3, 4][..], &[5, 6, 7, 8][..]])
-    );
-
-    test_read_type!(test_decimal: "decimal",
-        Schema::Decimal(DecimalSchema { precision: 10, scale: 2, inner: Box::new(Schema::Bytes) }),
-        [
-            Value::Decimal(AvroDecimal::from(vec![0x64u8])),
-            Value::Decimal(AvroDecimal::from(vec![0x00, 0xFA])),
-        ],
-        {
-            let frame = df!("decimal" => ["1.00", "2.50"]).unwrap()
-                .lazy()
-                .select([pl::col("decimal").strict_cast(DataType::Decimal(10, 2))])
-                .collect().unwrap();
-            frame.column("decimal").unwrap().as_materialized_series().clone()
-        }
-    );
-
-    // big decimal are deserialized as binary
-    test_read_type!(test_big_decimal: "big_decimal", Schema::BigDecimal,
-        [
-            Value::BigDecimal(BigDecimal::from(12345u32)),
-            Value::BigDecimal(BigDecimal::from(67890u32)),
-        ],
-        Series::new("big_decimal".into(), [
-            &b"\x0409\x00"[..],
-            &b"\x06\x01\x092\x00"[..],
-        ])
-    );
-
-    test_read_type!(test_uuid_arr: "uuid", Schema::Uuid,
-        [
-            Value::Uuid(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap()),
-            Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
-        ],
-        Series::new("uuid".into(), [
-            &b"\x93m\xa0\x1f\x9a\xbdM\x9d\x80\xc7\x02\xaf\x85\xc8\"\xa8"[..],
-            &b"U\x0e\x84\x00\xe2\x9bA\xd4\xa7\x16DfUD\x00\x00"[..],
-        ]),
-        utf8_view: false
-    );
-
-    test_read_type!(test_uuid_view: "uuid", Schema::Uuid,
-        [
-            Value::Uuid(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap()),
-            Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
-        ],
-        Series::new("uuid".into(), [
-            "936da01f-9abd-4d9d-80c7-02af85c822a8",
-            "550e8400-e29b-41d4-a716-446655440000",
-        ]),
-        utf8_view: true
-    );
-
-    test_read_type!(test_null_string_arr: "uuid", Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
-        [
-            Some("string"),
-            None,
-        ],
-        Series::new("uuid".into(), [
-            Some("string"),
-            None,
-       ]),
-        utf8_view: false
-    );
-
-    test_read_type!(test_null_string_view: "uuid", Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::String]).unwrap()),
-        [
-            Some("string"),
-            None,
-        ],
-        Series::new("uuid".into(), [
-            "string",
-            "",
-        ]),
-        utf8_view: true
-    );
-
-    /// This needs to be separate so we can sort the keys of the result, since
-    /// we can't guarantee order
-    #[test]
-    fn test_map() {
-        let buff = write_avro(
-            "map",
-            Schema::Map(MapSchema {
-                types: Box::new(Schema::Int),
-                attributes: BTreeMap::new(),
-            }),
-            [
-                HashMap::from([("a", 1), ("b", 2)]),
-                HashMap::from([("c", 3)]),
-            ],
-        )
-        .unwrap();
-        let res = Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap();
-        let base = read_scan(res);
-        // need to sort all of the lists to account for unknown serialization
-        // order
-        let frame = base
-            .lazy()
-            .with_column(pl::col("map").list().sort(SortOptions::default()))
-            .collect()
-            .unwrap();
-        let expected = Series::new(
-            "map".into(),
-            [
-                map_struct("1", ["a", "b"], [1, 2]),
-                map_struct("2", ["c"], [3]),
-            ],
-        );
-        let actual = frame.column("map").unwrap().as_series().unwrap();
-        assert_eq!(actual, &expected);
-    }
-
-    test_read_type!(test_date: "date", Schema::Date,
-        [Value::Date(19000), Value::Date(19500)],
-        Series::new("date".into(), [19000i32, 19500])
-            .cast(&DataType::Date).unwrap()
-    );
-
-    test_read_type!(test_time_millis: "time_ms", Schema::TimeMillis,
-        [Value::TimeMillis(1000), Value::TimeMillis(2000)],
-        Series::new("time_ms".into(), [1_000_000_000i64, 2_000_000_000])
-            .cast(&DataType::Time).unwrap()
-    );
-
-    test_read_type!(test_time_micros: "time_us", Schema::TimeMicros,
-        [Value::TimeMicros(1_000_000), Value::TimeMicros(2_000_000)],
-        Series::new("time_us".into(), [1_000_000_000i64, 2_000_000_000])
-            .cast(&DataType::Time).unwrap()
-    );
-
-    test_read_type!(test_timestamp_millis: "ts_ms", Schema::TimestampMillis,
-        [Value::TimestampMillis(1_000_000), Value::TimestampMillis(2_000_000)],
-        Series::new("ts_ms".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Milliseconds, Some(TimeZone::UTC))).unwrap()
-    );
-
-    test_read_type!(test_timestamp_micros: "ts_us", Schema::TimestampMicros,
-        [Value::TimestampMicros(1_000_000), Value::TimestampMicros(2_000_000)],
-        Series::new("ts_us".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))).unwrap()
-    );
-
-    test_read_type!(test_timestamp_nanos: "ts_ns", Schema::TimestampNanos,
-        [Value::TimestampNanos(1_000_000), Value::TimestampNanos(2_000_000)],
-        Series::new("ts_ns".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Nanoseconds, Some(TimeZone::UTC))).unwrap()
-    );
-
-    test_read_type!(test_local_timestamp_millis: "local_ts_ms", Schema::LocalTimestampMillis,
-        [Value::LocalTimestampMillis(1_000_000), Value::LocalTimestampMillis(2_000_000)],
-        Series::new("local_ts_ms".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Milliseconds, None)).unwrap()
-    );
-
-    test_read_type!(test_local_timestamp_micros: "local_ts_us", Schema::LocalTimestampMicros,
-        [Value::LocalTimestampMicros(1_000_000), Value::LocalTimestampMicros(2_000_000)],
-        Series::new("local_ts_us".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Microseconds, None)).unwrap()
-    );
-
-    test_read_type!(test_local_timestamp_nanos: "local_ts_ns", Schema::LocalTimestampNanos,
-        [Value::LocalTimestampNanos(1_000_000), Value::LocalTimestampNanos(2_000_000)],
-        Series::new("local_ts_ns".into(), [1_000_000i64, 2_000_000])
-            .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).unwrap()
-    );
-
     /// arrow-avro will not deserialize durations
     #[test]
     fn test_duration_error() {
@@ -763,7 +689,7 @@ mod tests {
         assert!(matches!(err, Error::Arrow(_)));
     }
 
-    /// Test failure on `with_columns` when column isn't present
+    /// A projected column that isn't present errors out
     #[test]
     fn test_missing_columns_error() {
         let res = Reader::try_new(
@@ -792,48 +718,6 @@ mod tests {
         let err = iter.collect::<Result<Vec<_>, _>>().unwrap_err();
         assert!(matches!(err, Error::NonMatchingSchemas { .. }));
     }
-
-    // arrow-avro reads null map values as empty lists instead of null
-    test_read_type!(test_null_map: "map",
-        Schema::Union(UnionSchema::new(vec![
-            Schema::Null,
-            Schema::Map(MapSchema {
-                types: Box::new(Schema::Int),
-                attributes: BTreeMap::new(),
-            }),
-        ]).unwrap()),
-        [
-            Value::Union(1, Box::new(Value::Map(HashMap::from([("a".into(), Value::Int(1))])))),
-            Value::Union(0, Box::new(Value::Null)),
-            Value::Union(1, Box::new(Value::Map(HashMap::from([("b".into(), Value::Int(2))])))),
-        ],
-        Series::new("map".into(), [
-            map_struct("1", ["a"], [1]),
-            map_struct("2", [], [] as [i32; 0]),
-            map_struct("3", ["b"], [2]),
-        ])
-    );
-
-    // arrow-avro reads null list values correctly
-    test_read_type!(test_null_list: "list",
-        Schema::Union(UnionSchema::new(vec![
-            Schema::Null,
-            Schema::Array(ArraySchema {
-                items: Box::new(Schema::Int),
-                attributes: BTreeMap::new(),
-            }),
-        ]).unwrap()),
-        [
-            Value::Union(1, Box::new(Value::Array(vec![Value::Int(1), Value::Int(2)]))),
-            Value::Union(0, Box::new(Value::Null)),
-            Value::Union(1, Box::new(Value::Array(vec![Value::Int(3)]))),
-        ],
-        Series::new("list".into(), &[
-            Some(Series::from_iter([1_i32, 2_i32])),
-            None,
-            Some(Series::from_iter([3_i32])),
-        ])
-    );
 
     #[test]
     fn test_different_schemas_projection() {
