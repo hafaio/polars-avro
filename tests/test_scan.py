@@ -3,6 +3,7 @@
 from io import BytesIO
 
 import fastavro
+import fsspec  # type: ignore[reportMissingTypeStubs]
 import polars as pl
 import pytest
 
@@ -221,6 +222,30 @@ def test_empty_sources() -> None:
     lazy = scan_avro([])
     with pytest.raises(Exception, match="must scan at least one source"):
         lazy.collect()
+
+
+def test_cloud_scan() -> None:
+    """Test scanning a cloud URL through fsspec (using its in-process memory fs)."""
+    frame = pl.from_dict({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+    buff = BytesIO()
+    write_avro(frame, buff)
+    with fsspec.open("memory://cloud_test.avro", "wb") as handle:  # type: ignore[reportUnknownMemberType]
+        handle.write(buff.getvalue())  # type: ignore[reportUnknownMemberType]
+
+    # memory:// is a cloud scheme, so scan_avro routes it through fsspec
+    assert read_avro("memory://cloud_test.avro").equals(frame)
+
+    # scan, re-collect, and a projection (exercises the per-scan fsspec re-open)
+    lazy = scan_avro("memory://cloud_test.avro")
+    assert lazy.collect().equals(frame)
+    assert lazy.collect().equals(frame)
+    assert read_avro(
+        "memory://cloud_test.avro", columns=["y"]
+    ).to_series().to_list() == [
+        "a",
+        "b",
+        "c",
+    ]
 
 
 class SentinelError(AssertionError):

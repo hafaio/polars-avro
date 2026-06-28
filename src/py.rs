@@ -15,17 +15,55 @@ use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write
 use std::iter::{Chain, Fuse};
 use std::sync::Arc;
 
+/// Hardcoded read buffer for python-backed (`PyIO`) sources, so we batch the
+/// per-read python callbacks (and cloud round-trips) into large chunks. Local
+/// files don't need this — the OS already buffers them natively.
+const PY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// A python file obtained by entering the context manager from a source
+/// factory. The manager's `__exit__` is called when this is dropped, so cloud
+/// connections are released promptly after each scan.
+#[derive(Debug)]
+struct EnteredSource {
+    file: PyIO,
+    ctx: Py<PyAny>,
+}
+
+impl Read for EnteredSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for EnteredSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+impl Drop for EnteredSource {
+    fn drop(&mut self) {
+        Python::attach(|py| {
+            let none = py.None();
+            let _ = self
+                .ctx
+                .bind(py)
+                .call_method1("__exit__", (&none, &none, &none));
+        });
+    }
+}
+
 #[derive(Debug)]
 enum ScanSource {
     File(File),
-    Bytes(PyIO),
+    Opened(BufReader<EnteredSource>),
 }
 
 impl Read for ScanSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             ScanSource::File(reader) => reader.read(buf),
-            ScanSource::Bytes(cursor) => cursor.read(buf),
+            ScanSource::Opened(reader) => reader.read(buf),
         }
     }
 }
@@ -34,34 +72,44 @@ impl Seek for ScanSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             ScanSource::File(reader) => reader.seek(pos),
-            ScanSource::Bytes(cursor) => cursor.seek(pos),
+            ScanSource::Opened(reader) => reader.seek(pos),
         }
     }
 }
 
+/// Iterates source factories, calling each to get a fresh context manager and
+/// entering it (`__enter__`) on demand.
 #[derive(Debug)]
-struct BytesIter {
-    buffs: Arc<[(PyIO, u64)]>,
+struct CtxIter {
+    factories: Arc<[Py<PyAny>]>,
     idx: usize,
 }
 
-impl BytesIter {
-    fn new(buffs: Arc<[(PyIO, u64)]>) -> Self {
-        Self { buffs, idx: 0 }
+impl CtxIter {
+    fn new(factories: Arc<[Py<PyAny>]>) -> Self {
+        Self { factories, idx: 0 }
     }
 }
 
-impl Iterator for BytesIter {
+impl Iterator for CtxIter {
     type Item = Result<ScanSource, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.buffs.get(self.idx).map(|(buff, pos)| {
+        self.factories.get(self.idx).map(|factory| {
             self.idx += 1;
-            // reset the buffer
-            // NOTE there's a race condition here if two things are iterating
-            // over this at the same time, but that _shouldn't_ happen
-            buff.py_seek(SeekFrom::Start(*pos))?;
-            Ok(ScanSource::Bytes(buff.clone()))
+            Python::attach(|py| {
+                let ctx = factory.bind(py).call0()?;
+                let file = ctx.call_method0("__enter__")?.unbind();
+                let entered = EnteredSource {
+                    file: PyIO(Arc::new(file)),
+                    ctx: ctx.unbind(),
+                };
+                Ok(ScanSource::Opened(BufReader::with_capacity(
+                    PY_BUFFER_CAPACITY,
+                    entered,
+                )))
+            })
+            .map_err(|err: PyErr| Error::IO(io::Error::other(err.to_string()), "source".into()))
         })
     }
 }
@@ -92,7 +140,7 @@ impl Iterator for PathIter {
     }
 }
 
-type SourceIter = Chain<PathIter, BytesIter>;
+type SourceIter = Chain<PathIter, CtxIter>;
 
 #[pyclass]
 #[derive(Debug)]
@@ -188,13 +236,13 @@ impl Seek for PyIO {
 #[derive(Debug, Clone)]
 pub struct AvroSource {
     paths: Arc<[String]>,
-    buffs: Arc<[(PyIO, u64)]>,
+    sources: Arc<[Py<PyAny>]>,
     schema: Option<SchemaRef>,
 }
 
 impl AvroSource {
     fn get_sources(&self) -> SourceIter {
-        PathIter::new(self.paths.clone()).chain(BytesIter::new(self.buffs.clone()))
+        PathIter::new(self.paths.clone()).chain(CtxIter::new(self.sources.clone()))
     }
 
     fn get_schema(&mut self) -> Result<SchemaRef, Error> {
@@ -212,19 +260,13 @@ impl AvroSource {
 #[pymethods]
 impl AvroSource {
     #[new]
-    #[pyo3(signature = (paths, buffs))]
-    fn new(paths: Vec<String>, buffs: Vec<Py<PyAny>>) -> Result<Self, PyErr> {
-        Ok(Self {
+    #[pyo3(signature = (paths, sources))]
+    fn new(paths: Vec<String>, sources: Vec<Py<PyAny>>) -> Self {
+        Self {
             paths: paths.into(),
-            buffs: buffs
-                .into_iter()
-                .map(|obj| {
-                    let mut buff = PyIO(Arc::new(obj));
-                    buff.stream_position().map(move |pos| (buff, pos))
-                })
-                .collect::<Result<_, _>>()?,
+            sources: sources.into(),
             schema: None,
-        })
+        }
     }
 
     /// Return the file schema as a pyarrow `Schema`.
@@ -291,6 +333,7 @@ impl From<Codec> for CompressionCodec {
     }
 }
 
+/// A sink writing avro to a local file.
 #[pyclass]
 pub struct AvroFileSink(Writer<BufWriter<File>>);
 
@@ -313,10 +356,12 @@ impl AvroFileSink {
     }
 
     #[pyo3(signature = ())]
-    #[allow(clippy::unused_self)]
-    fn close(&mut self) {}
+    fn close(&mut self) -> Result<(), PyErr> {
+        Ok(self.0.finish()?)
+    }
 }
 
+/// A sink writing avro to a python binary buffer.
 #[pyclass]
 pub struct AvroBuffSink(Writer<BufWriter<PyIO>>);
 
@@ -339,8 +384,9 @@ impl AvroBuffSink {
     }
 
     #[pyo3(signature = ())]
-    #[allow(clippy::unused_self)]
-    fn close(&mut self) {}
+    fn close(&mut self) -> Result<(), PyErr> {
+        Ok(self.0.finish()?)
+    }
 }
 
 impl From<Error> for PyErr {

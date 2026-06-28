@@ -32,12 +32,24 @@ impl<W: Write> Writer<W> {
         Ok(Writer { base, schema })
     }
 
+    /// Finish writing, flushing any buffered data through the underlying writer.
+    ///
+    /// Idempotent and non-consuming, so a sink can flush on close without
+    /// giving up ownership of the writer.
+    ///
+    /// # Errors
+    /// If there were problems flushing the writer
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.base.finish()?;
+        Ok(())
+    }
+
     /// Finish writing and return the underlying writer.
     ///
     /// # Errors
     /// If there were problems flushing the writer
     pub fn into_inner(mut self) -> Result<W, Error> {
-        self.base.finish()?;
+        self.finish()?;
         Ok(self.base.into_inner())
     }
 

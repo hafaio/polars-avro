@@ -20,6 +20,17 @@ frame = read_avro(path)
 write_avro([frame], path)
 ```
 
+Both `scan_avro` and `read_avro` accept cloud and other URLs (`s3://`, `gs://`,
+`az://`, `http(s)://`, ...), read through
+[fsspec](https://filesystem-spec.readthedocs.io/) — install the relevant backend
+(e.g. `s3fs`) and pass `storage_options` (forwarded to `fsspec.open`) for
+credentials:
+
+```py
+lazy = scan_avro("s3://bucket/data.avro", storage_options={"anon": True})
+frame = read_avro("s3://bucket/data.avro", storage_options={"anon": True})
+```
+
 ## Rust Usage
 
 There are two main exports: [`Reader`] for iterating `DataFrame`s from avro

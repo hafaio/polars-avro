@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from glob import iglob
 from os import path
 from pathlib import Path
@@ -10,6 +10,7 @@ from polars import DataFrame, Expr, LazyFrame
 from polars.io.plugins import register_io_source
 
 from ._avro_rs import AvroSource
+from ._source import SourceFactory, cloud_factory, is_url, seekable_factory
 
 
 def _arrow_to_frame(data: pa.Table | pa.RecordBatch) -> DataFrame:
@@ -30,23 +31,26 @@ def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
         yield expanded
 
 
-def scan_avro(
+def scan_avro(  # noqa: PLR0913
     sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
     *,
     batch_size: int = 1024,
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
+    storage_options: Mapping[str, str] | None = None,
 ) -> LazyFrame:
     """Scan Avro files.
 
     Parameters
     ----------
-    sources : The source(s) to scan. Local file paths or readable binary
-        buffers. Binary buffers must be seekable (support ``seek``/``tell``);
-        the reader rewinds them to read headers and to rewind for projection.
+    sources : The source(s) to scan: local file paths, cloud URLs (``s3://``,
+        ``gs://``, ``az://``, ``http(s)://``, ...), or readable binary buffers.
+        Binary buffers must be seekable (support ``seek``/``tell``); the reader
+        rewinds them to read headers and to rewind for projection. Cloud URLs
+        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``).
     batch_size : How many rows to attempt to read at a time.
-    glob : Whether to use globbing to find files.
+    glob : Whether to use globbing to find files (local paths only).
     strict : Whether to use strict mode when parsing avro. Incurs a
         performance hit.
     utf8_view : Whether to read strings as views. When ``False`` (default),
@@ -54,25 +58,32 @@ def scan_avro(
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
+    storage_options : Extra options forwarded to ``fsspec.open`` for cloud URLs.
     """
-    # normalize sources
+    # normalize sources: local paths read natively, cloud/buffers open lazily
+    opts = storage_options or {}
     strs: list[str] = []
-    bins: list[BinaryIO] = []
+    opened: list[SourceFactory] = []
+
+    def classify(source: str | Path | BinaryIO) -> None:
+        match source:
+            case str() if is_url(source):
+                opened.append(cloud_factory(source, opts))
+            case str() | Path():
+                strs.extend(expand_str(source, glob=glob))
+            case _:
+                opened.append(seekable_factory(source))
+
     match sources:
         case [*_]:
             for source in sources:
-                if isinstance(source, str | Path):
-                    strs.extend(expand_str(source, glob=glob))
-                else:
-                    bins.append(source)
-        case str() | Path():
-            strs.extend(expand_str(sources, glob=glob))
+                classify(source)
         case _:
-            bins.append(sources)
+            classify(sources)
 
     def_batch_size = batch_size
 
-    src = AvroSource(strs, bins)
+    src = AvroSource(strs, opened)
 
     def get_schema() -> pl.Schema:
         return _arrow_to_frame(src.schema().empty_table()).schema
@@ -118,14 +129,17 @@ def read_avro(  # noqa: PLR0913
     glob: bool = True,
     strict: bool = False,
     utf8_view: bool = False,
+    storage_options: Mapping[str, str] | None = None,
 ) -> DataFrame:
     """Read an Avro file into a DataFrame.
 
     Parameters
     ----------
-    sources : The source(s) to scan. Local file paths or readable binary
-        buffers. Binary buffers must be seekable (support ``seek``/``tell``);
-        the reader rewinds them to read headers and to rewind for projection.
+    sources : The source(s) to scan: local file paths, cloud URLs (``s3://``,
+        ``gs://``, ``az://``, ``http(s)://``, ...), or readable binary buffers.
+        Binary buffers must be seekable (support ``seek``/``tell``); the reader
+        rewinds them to read headers and to rewind for projection. Cloud URLs
+        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``).
     columns : The columns to select.
     n_rows : The number of rows to read.
     row_index_name : The name of the row index column, or None to not add one.
@@ -140,6 +154,7 @@ def read_avro(  # noqa: PLR0913
         ``True``, UUIDs are read as formatted strings and nulls in nullable
         strings are replaced with ``""`` (lossy). Since polars tends to work
         with string views internally, ``True`` is likely faster.
+    storage_options : Extra options forwarded to ``fsspec.open`` for cloud URLs.
     """
     lazy = scan_avro(
         sources,
@@ -147,6 +162,7 @@ def read_avro(  # noqa: PLR0913
         glob=glob,
         strict=strict,
         utf8_view=utf8_view,
+        storage_options=storage_options,
     )
     if columns is not None:
         # see the filter note in scan_avro: the native import perturbs pyright's

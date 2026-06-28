@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import BinaryIO
 
 import pyarrow as pa
@@ -26,12 +28,17 @@ class AvroIter:
 class AvroSource:
     """A pseudo-iterator over Avro files.
 
-    The binary buffers in ``buffs`` must be seekable (support ``seek`` and
-    ``tell``): the reader rewinds them to read headers and, when projecting,
-    to re-read from the start of the data.
+    ``paths`` are local files read natively. ``sources`` are factories, each
+    returning a fresh single-use context manager whose ``__enter__`` yields a
+    seekable binary file and whose ``__exit__`` releases it; the reader calls a
+    factory once per scan (and re-call to rewind).
     """
 
-    def __init__(self, paths: list[str], buffs: list[BinaryIO]) -> None: ...
+    def __init__(
+        self,
+        paths: list[str],
+        sources: list[Callable[[], AbstractContextManager[BinaryIO]]],
+    ) -> None: ...
     def schema(self) -> pa.Schema: ...
     def batch_iter(
         self,
