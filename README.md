@@ -33,24 +33,32 @@ frame = read_avro("s3://bucket/data.avro", storage_options={"anon": True})
 
 ## Rust Usage
 
-There are two main exports: [`Reader`] for iterating `DataFrame`s from avro
-sources, and [`Writer`] for writing `DataFrame`s to an avro file.
+There are two main exports: [`Reader`] for iterating arrow `RecordBatch`es from
+avro sources, and [`Writer`] for writing `RecordBatch`es to an avro file.
 
 ```rs
-use polars_avro::{Reader, Writer, ReadOptions};
+use polars_avro::{FullReadOptions, Reader, Writer};
+use std::fs::File;
 
-// read
-let reader = Reader::try_new(
+// `Reader` yields arrow `RecordBatch`es from one or more avro sources
+let mut reader = Reader::try_new(
     [File::open("data.avro")],
-    ReadOptions::basic(),
+    FullReadOptions::default(),
 ).unwrap();
-for batch in reader {
-    let frame = batch.unwrap();
-}
 
-// write
-let mut writer = Writer::try_new(file, frame.schema(), None).unwrap();
-writer.write(&frame).unwrap();
+// copy them into a new file; `Writer` needs a schema up front, so take it
+// from the first batch
+let first = reader.next().unwrap().unwrap();
+let mut writer = Writer::try_new(
+    File::create("copy.avro").unwrap(),
+    first.schema(),
+    None,
+).unwrap();
+writer.write(&first).unwrap();
+for batch in reader {
+    writer.write(&batch.unwrap()).unwrap();
+}
+writer.finish().unwrap();
 ```
 
 > ℹ️ Avro supports writing with file compression schemes. In rust these need
