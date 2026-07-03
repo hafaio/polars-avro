@@ -21,6 +21,8 @@ pub enum Error {
     ArrowAvro(ArrowAvroError),
     /// An error from parsing the avro header
     Avro(AvroError),
+    /// An error serializing a projected schema back to json
+    Json(serde_json::Error),
     /// Cannot scan empty sources
     EmptySources,
     /// Top level avro schema must be a record
@@ -48,6 +50,7 @@ impl Display for Error {
             Error::Arrow(e) => write!(f, "Error from arrow: {e}"),
             Error::ArrowAvro(e) => write!(f, "Error from arrow-avro: {e}"),
             Error::Avro(e) => write!(f, "Error from avro: {e}"),
+            Error::Json(e) => write!(f, "Error serializing schema: {e}"),
             Error::EmptySources => write!(f, "Cannot scan empty sources"),
             Error::NonRecordSchema => write!(f, "Top level avro schema must be a record"),
             Error::LargeHeader => write!(f, "Avro header is too large"),
@@ -110,6 +113,12 @@ impl From<AvroError> for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::IO(value, "io".into())
@@ -144,10 +153,12 @@ mod tests {
             Field::new("added", ArrowDataType::Boolean, false),
         ]));
         let avro_err = apache_avro::Schema::parse_str("not a schema").unwrap_err();
+        let json_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         for err in [
             Error::Arrow(ArrowError::NotYetImplemented("test".into())),
             Error::ArrowAvro(ArrowAvroError::General("test".into())),
             Error::Avro(avro_err),
+            Error::Json(json_err),
             Error::EmptySources,
             Error::NonRecordSchema,
             Error::LargeHeader,
@@ -177,6 +188,10 @@ mod tests {
         assert!(matches!(
             Error::from(io::Error::other("boom")),
             Error::IO(_, _)
+        ));
+        assert!(matches!(
+            Error::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            Error::Json(_)
         ));
     }
 

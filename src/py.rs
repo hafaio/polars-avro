@@ -284,18 +284,6 @@ impl AvroSource {
         batch_size: usize,
         with_columns: Option<Vec<String>>,
     ) -> PyResult<PyAvroIter> {
-        let projection = if with_columns.is_none() && strict {
-            let base_schema = self.get_schema()?;
-            Some(
-                base_schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.name().clone())
-                    .collect(),
-            )
-        } else {
-            with_columns
-        };
         Ok(PyAvroIter(
             Reader::try_new(
                 self.get_sources(),
@@ -303,7 +291,7 @@ impl AvroSource {
                     strict,
                     utf8_view,
                     batch_size,
-                    projection,
+                    projection: with_columns,
                 },
             )?
             .fuse(),
@@ -395,6 +383,7 @@ impl From<Error> for PyErr {
             Error::Arrow(err) => AvroError::new_err(err.to_string()),
             Error::ArrowAvro(err) => AvroError::new_err(err.to_string()),
             Error::Avro(err) => AvroError::new_err(err.to_string()),
+            Error::Json(err) => AvroError::new_err(err.to_string()),
             Error::EmptySources => EmptySources::new_err("must scan at least one source"),
             Error::NonRecordSchema => {
                 AvroSpecError::new_err("top level avro schema must be a record")

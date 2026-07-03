@@ -927,6 +927,7 @@ dependencies = [
  "arrow-avro",
  "pyo3",
  "pyo3-arrow",
+ "serde_json",
  "uuid",
 ]
 

@@ -15,7 +15,9 @@ use std::sync::Arc;
 /// Configuration options for the avro reader
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOptions<P = Infallible> {
-    /// If we should use strict parsing. Incurs a performance hit.
+    /// Enable stricter avro union handling: reject unions where `null` is not
+    /// the first branch (`[T, "null"]` rather than `["null", T]`) instead of
+    /// accepting them.
     pub strict: bool,
     /// If strings should be read in as views instead of character arrays.
     ///
@@ -65,7 +67,11 @@ impl<P: Projection> ReadOptions<P> {
             let cur = buf_reader.stream_position()?;
             let seek = orig.checked_signed_diff(cur).ok_or(Error::LargeHeader)?;
             buf_reader.seek_relative(seek)?;
-            builder = builder.with_reader_schema(AvroSchema::new(projected.canonical_form()));
+            // serialize the full schema, not `canonical_form()`: parsing
+            // canonical form drops `logicalType`, which would silently decode
+            // dates/timestamps/decimals/uuids as their raw primitives
+            builder =
+                builder.with_reader_schema(AvroSchema::new(serde_json::to_string(&projected)?));
         }
         Ok(builder.build(buf_reader)?)
     }
@@ -112,7 +118,7 @@ where
     }
 
     fn matched_schema(&self, batch: &RecordBatch) -> bool {
-        self.options.projection.is_some() || batch.schema() == self.schema
+        batch.schema() == self.schema
     }
 }
 
@@ -735,5 +741,44 @@ mod tests {
         .unwrap();
         let err = iter.collect::<Result<Vec<_>, _>>().unwrap_err();
         assert!(matches!(err, Error::ColumnNotFound(_)));
+    }
+
+    /// Two sources sharing a column name but with different types are caught
+    /// even under a projection, which used to bypass the schema check.
+    #[test]
+    fn test_different_types_projection() {
+        let one = write_avro("x", Schema::Int, [1, 2, 3]).unwrap();
+        let two = write_avro("x", Schema::String, ["a", "b", "c"]).unwrap();
+
+        let iter = Reader::try_new(
+            [ok(one), ok(two)],
+            ReadOptions {
+                batch_size: 2,
+                projection: Some(&["x"][..]),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap();
+        let err = iter.collect::<Result<Vec<_>, _>>().unwrap_err();
+        assert!(matches!(err, Error::NonMatchingSchemas { .. }), "{err:?}");
+    }
+
+    /// Projecting a logical-typed column keeps its logical arrow type instead of
+    /// decoding it as the raw underlying primitive (parsing canonical form used
+    /// to strip `logicalType`).
+    #[test]
+    fn test_projection_preserves_logical_type() {
+        let buff = write_avro("d", Schema::Date, [Value::Date(18262)]).unwrap();
+        let frame = collect_one(
+            Reader::try_new(
+                [ok(buff)],
+                ReadOptions {
+                    projection: Some(&["d"][..]),
+                    ..ReadOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(frame.column(0).data_type(), &DataType::Date32);
     }
 }
