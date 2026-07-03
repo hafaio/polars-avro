@@ -32,9 +32,9 @@ def create_writer(
 class AvroWriter:
     """Incrementally write DataFrames to an Avro file.
 
-    Some polars types (Int8, Int16, UInt8, UInt16, UInt32, UInt64, Time,
-    Categorical, Enum) must be cast before writing — see the README for
-    workarounds.
+    Most polars types write directly (narrow ints widen, Time truncates to
+    microseconds); only Categorical, Enum, and out-of-range UInt64 values must
+    be cast before writing — see the README for workarounds.
     """
 
     def __init__(
@@ -90,9 +90,9 @@ def write_avro(
 ) -> None:
     """Write a DataFrame or iterable of DataFrames to an Avro file.
 
-    Some polars types (Int8, Int16, UInt8, UInt16, UInt32, UInt64, Time,
-    Categorical, Enum) must be cast before writing — see the README for
-    workarounds.
+    Most polars types write directly (narrow ints widen, Time truncates to
+    microseconds); only Categorical, Enum, and out-of-range UInt64 values must
+    be cast before writing — see the README for workarounds.
 
     Parameters
     ----------
