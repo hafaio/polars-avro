@@ -210,6 +210,40 @@ def test_read_options() -> None:
     assert frame["row_index"].to_list() == [*range(11)]
 
 
+def test_projection_preserves_logical_types() -> None:
+    """Projection and strict mode must keep logical types, not raw primitives."""
+    frame = pl.DataFrame(
+        {
+            "ts": pl.Series([0], dtype=pl.Datetime("us")),
+            "d": pl.Series([18262], dtype=pl.Int32).cast(pl.Date),
+            "x": pl.Series([42], dtype=pl.Int64),
+        }
+    )
+    buff = BytesIO()
+    write_avro(frame, buff)
+
+    buff.seek(0)
+    projected = scan_avro(buff).select("ts", "d").collect()  # type: ignore
+    assert projected.schema == {"ts": pl.Datetime("us"), "d": pl.Date}
+    assert projected["ts"].to_list() == frame["ts"].to_list()
+
+    buff.seek(0)
+    strict = scan_avro(buff, strict=True).collect()
+    assert strict.schema == frame.schema
+
+
+def test_projection_different_types_errors() -> None:
+    """Two sources with a shared column of different types error under projection."""
+    one = BytesIO()
+    write_avro(pl.DataFrame({"x": pl.Series([1], dtype=pl.Int64)}), one)
+    two = BytesIO()
+    write_avro(pl.DataFrame({"x": ["a"]}), two)
+    one.seek(0)
+    two.seek(0)
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        scan_avro([one, two]).select("x").collect()  # type: ignore
+
+
 def test_filename_in_err() -> None:
     """Test that invalid filename is reported in error."""
     lazy = scan_avro("does not exist")

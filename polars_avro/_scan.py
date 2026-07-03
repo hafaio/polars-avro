@@ -51,8 +51,9 @@ def scan_avro(  # noqa: PLR0913
         require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``).
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files (local paths only).
-    strict : Whether to use strict mode when parsing avro. Incurs a
-        performance hit.
+    strict : Whether to enable stricter avro union handling, rejecting unions
+        where ``null`` is not the first branch (``[T, "null"]`` rather than
+        ``["null", T]``) instead of accepting them.
     utf8_view : Whether to read strings as views. When ``False`` (default),
         UUIDs are read as binary and nullable strings preserve nulls. When
         ``True``, UUIDs are read as formatted strings and nulls in nullable
@@ -147,8 +148,9 @@ def read_avro(  # noqa: PLR0913
     rechunk : Whether to rechunk the DataFrame after reading.
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files.
-    strict : Whether to use strict mode when parsing avro. Incurs a
-        performance hit.
+    strict : Whether to enable stricter avro union handling, rejecting unions
+        where ``null`` is not the first branch (``[T, "null"]`` rather than
+        ``["null", T]``) instead of accepting them.
     utf8_view : Whether to read strings as views. When ``False`` (default),
         UUIDs are read as binary and nullable strings preserve nulls. When
         ``True``, UUIDs are read as formatted strings and nulls in nullable
