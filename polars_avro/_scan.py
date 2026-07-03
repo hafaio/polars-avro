@@ -24,9 +24,17 @@ def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
     """Expand a string or Path to a list of file paths."""
     expanded = path.expanduser(path.expandvars(source))
     if glob and "*" in expanded:
-        yield from sorted(iglob(expanded))
+        matches = sorted(iglob(expanded))
+        if not matches:
+            raise FileNotFoundError(f"no files matched glob pattern: {expanded}")
+        else:
+            yield from matches
     elif path.isdir(expanded):
-        yield from sorted(iglob(path.join(expanded, "*")))
+        matches = sorted(iglob(path.join(expanded, "*")))
+        if not matches:
+            raise FileNotFoundError(f"no files found in directory: {expanded}")
+        else:
+            yield from matches
     else:
         yield expanded
 
