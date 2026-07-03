@@ -8,9 +8,10 @@ use std::io::Write;
 
 /// Incrementally write avro files.
 ///
-/// Some arrow types (`Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`, `UInt64`,
-/// `Time`, dictionary-encoded types) can't be written directly and must be cast
-/// first — see the README for workarounds.
+/// Most arrow types write directly (narrow ints widen, `Time` truncates to
+/// microseconds); only dictionary-encoded types and out-of-range `UInt64`
+/// values can't be written and must be cast first — see the README for
+/// workarounds.
 pub struct Writer<W: Write> {
     base: AvroWriter<W>,
     schema: SchemaRef,
