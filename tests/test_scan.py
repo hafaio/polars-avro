@@ -1,6 +1,7 @@
 """Test scan functionality."""
 
 from io import BytesIO
+from pathlib import Path
 
 import fastavro
 import fsspec  # type: ignore[reportMissingTypeStubs]
@@ -134,6 +135,22 @@ def test_glob_single_scan() -> None:
 
     assert explain.count("SCAN") == 1
     assert "UNION" not in explain
+
+
+def test_glob_no_match_errors() -> None:
+    """A glob matching no files raises instead of silently dropping data."""
+    with pytest.raises(FileNotFoundError, match="no files matched"):
+        scan_avro("resources/nomatch*.avro")
+
+    # even alongside a good source, a typo'd pattern must not silently vanish
+    with pytest.raises(FileNotFoundError, match="no files matched"):
+        scan_avro(["resources/food.avro", "resources/nomatch*.avro"])
+
+
+def test_empty_directory_errors(tmp_path: Path) -> None:
+    """Scanning an empty directory raises rather than yielding no data."""
+    with pytest.raises(FileNotFoundError, match="no files found in directory"):
+        scan_avro(str(tmp_path))
 
 
 def test_scan_in_memory() -> None:
