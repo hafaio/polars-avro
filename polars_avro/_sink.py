@@ -69,16 +69,25 @@ class AvroWriter:
             self._sink.write(record_batch)
 
     def close(self) -> None:
-        if self._sink is not None:
+        if self._sink is None:
+            raise ValueError(
+                "cannot write an avro file without any batches unless a schema "
+                "is provided"
+            )
+        else:
             self._sink.close()
 
     def __exit__(
         self,
-        _exc_type: type[BaseException] | None,
+        exc_type: type[BaseException] | None,
         _exc: BaseException | None,
         _tb: TracebackType | None,
     ) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+        elif self._sink is not None:
+            # don't mask original exception
+            self._sink.close()
 
 
 def write_avro(
