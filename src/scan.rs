@@ -472,9 +472,11 @@ mod tests {
     }
 
     /// An I/O error raised by the underlying reader mid-stream is surfaced as an
-    /// error item. The file is larger than the `BufReader` buffer so the header
-    /// is read up front (letting construction succeed) while the failure lands
-    /// on a later block read.
+    /// error item.
+    ///
+    /// The file is larger than the `BufReader` buffer so the header is read up
+    /// front (letting construction succeed) while the failure lands on a later
+    /// block read.
     #[test]
     fn test_reader_error_propagates() {
         let bytes = write_avro("col", Schema::Int, 0..20_000)
