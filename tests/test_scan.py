@@ -130,6 +130,23 @@ def test_avro_list_arg() -> None:
     assert frame.row(0) == ("vegetables", 45, 0.5, 2)
 
 
+def test_mixed_source_order_preserved(tmp_path: Path) -> None:
+    """Rows follow argument order even when mixing local paths and buffers."""
+    path = tmp_path / "later.avro"
+    write_avro(pl.DataFrame({"x": [3, 4]}), path)
+
+    def buf() -> BytesIO:
+        handle = BytesIO()
+        write_avro(pl.DataFrame({"x": [1, 2]}), handle)
+        handle.seek(0)
+        return handle
+
+    # buffer before path: rows must not jump behind the local file
+    assert scan_avro([buf(), str(path)]).collect()["x"].to_list() == [1, 2, 3, 4]
+    # and the reverse order reverses the result
+    assert scan_avro([str(path), buf()]).collect()["x"].to_list() == [3, 4, 1, 2]
+
+
 def test_glob_single_scan() -> None:
     """Test that globbing works with a single file."""
     file_path = "resources/food*.avro"
@@ -166,7 +183,7 @@ def test_source_exception_type_preserved() -> None:
 
         yield Reader()  # type: ignore[misc]
 
-    source = AvroSource([], [factory])
+    source = AvroSource([factory])
     with pytest.raises(Interrupted, match="connection dropped"):
         source.schema()
 
