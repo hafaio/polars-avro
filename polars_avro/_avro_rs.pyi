@@ -36,8 +36,7 @@ class AvroSource:
 
     def __init__(
         self,
-        paths: list[str],
-        sources: list[Callable[[], AbstractContextManager[BinaryIO]]],
+        sources: list[str | Callable[[], AbstractContextManager[BinaryIO]]],
     ) -> None: ...
     def schema(self) -> pa.Schema: ...
     def batch_iter(

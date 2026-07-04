@@ -40,7 +40,7 @@ def expand_str(source: str | Path, *, glob: bool) -> Iterator[str]:
 
 
 def scan_avro(  # noqa: PLR0913
-    sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
+    sources: Sequence[str | Path | BinaryIO] | str | Path | BinaryIO,
     *,
     batch_size: int = 1024,
     glob: bool = True,
@@ -56,7 +56,9 @@ def scan_avro(  # noqa: PLR0913
         ``gs://``, ``az://``, ``http(s)://``, ...), or readable binary buffers.
         Binary buffers must be seekable (support ``seek``/``tell``); the reader
         rewinds them to read headers and to rewind for projection. Cloud URLs
-        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``).
+        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``). Sources
+        are read in the order given, so row order and ``row_index`` follow the
+        argument order regardless of source kind.
     batch_size : How many rows to attempt to read at a time.
     glob : Whether to use globbing to find files (local paths only).
     strict : Whether to enable stricter avro union handling, rejecting unions
@@ -69,19 +71,18 @@ def scan_avro(  # noqa: PLR0913
         with string views internally, ``True`` is likely faster.
     storage_options : Extra options forwarded to ``fsspec.open`` for cloud URLs.
     """
-    # normalize sources: local paths read natively, cloud/buffers open lazily
+    # one caller-ordered list, so row order follows argument order
     opts = storage_options or {}
-    strs: list[str] = []
-    opened: list[SourceFactory] = []
+    all_sources: list[str | SourceFactory] = []
 
     def classify(source: str | Path | BinaryIO) -> None:
         match source:
             case str() if is_url(source):
-                opened.append(cloud_factory(source, opts))
+                all_sources.append(cloud_factory(source, opts))
             case str() | Path():
-                strs.extend(expand_str(source, glob=glob))
+                all_sources.extend(expand_str(source, glob=glob))
             case _:
-                opened.append(seekable_factory(source))
+                all_sources.append(seekable_factory(source))
 
     match sources:
         case [*_]:
@@ -92,7 +93,7 @@ def scan_avro(  # noqa: PLR0913
 
     def_batch_size = batch_size
 
-    src = AvroSource(strs, opened)
+    src = AvroSource(all_sources)
 
     def get_schema() -> pl.Schema:
         return _arrow_to_frame(src.schema().empty_table()).schema
@@ -127,7 +128,7 @@ def scan_avro(  # noqa: PLR0913
 
 
 def read_avro(  # noqa: PLR0913
-    sources: Sequence[str | Path] | Sequence[BinaryIO] | str | Path | BinaryIO,
+    sources: Sequence[str | Path | BinaryIO] | str | Path | BinaryIO,
     *,
     columns: Sequence[int | str] | None = None,
     n_rows: int | None = None,
@@ -148,7 +149,9 @@ def read_avro(  # noqa: PLR0913
         ``gs://``, ``az://``, ``http(s)://``, ...), or readable binary buffers.
         Binary buffers must be seekable (support ``seek``/``tell``); the reader
         rewinds them to read headers and to rewind for projection. Cloud URLs
-        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``).
+        require ``fsspec`` (plus the relevant backend, e.g. ``s3fs``). Sources
+        are read in the order given, so row order and ``row_index`` follow the
+        argument order regardless of source kind.
     columns : The columns to select.
     n_rows : The number of rows to read.
     row_index_name : The name of the row index column, or None to not add one.
