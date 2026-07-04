@@ -1,7 +1,10 @@
 """Test scan functionality."""
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO
 
 import fastavro
 import fsspec  # type: ignore[reportMissingTypeStubs]
@@ -9,6 +12,7 @@ import polars as pl
 import pytest
 
 from polars_avro import read_avro, scan_avro, write_avro
+from polars_avro._avro_rs import AvroSource
 
 
 def test_scan_avro() -> None:
@@ -135,6 +139,36 @@ def test_glob_single_scan() -> None:
 
     assert explain.count("SCAN") == 1
     assert "UNION" not in explain
+
+
+def test_source_exception_type_preserved() -> None:
+    """A python exception from a source keeps its type across the rust boundary.
+
+    Reading through ``AvroSource`` directly avoids polars' io-plugin wrapper, so
+    the original exception (type, message, traceback) is observable — a
+    ``KeyboardInterrupt`` from a slow read is no longer flattened to a string.
+    """
+
+    class Interrupted(Exception):
+        pass
+
+    @contextmanager
+    def factory() -> Generator[BinaryIO, None, None]:
+        class Reader:
+            def read(self, _size: int = -1) -> bytes:
+                raise Interrupted("connection dropped")
+
+            def seek(self, pos: int, _whence: int = 0) -> int:
+                return pos
+
+            def tell(self) -> int:
+                return 0
+
+        yield Reader()  # type: ignore[misc]
+
+    source = AvroSource([], [factory])
+    with pytest.raises(Interrupted, match="connection dropped"):
+        source.schema()
 
 
 def test_glob_no_match_errors() -> None:

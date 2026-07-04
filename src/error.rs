@@ -11,10 +11,14 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io;
 use std::sync::Arc;
 
-/// Any error raised by this crate
+/// Any error raised by this crate.
+///
+/// `E` is the error type of the caller-supplied source iterator, forwarded
+/// unchanged through [`Error::User`]. It defaults to [`Infallible`] for sources
+/// that can't fail to open (and for everything that never touches a source).
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<E = Infallible> {
     /// An error from the arrow library
     Arrow(ArrowError),
     /// An error from the arrow-avro library
@@ -42,9 +46,37 @@ pub enum Error {
     ColumnIndexOutOfBounds(usize),
     /// I/O related errors
     IO(io::Error, String),
+    /// An error from the caller-supplied source iterator, forwarded unchanged
+    User(E),
 }
 
-impl Display for Error {
+impl Error<Infallible> {
+    /// Lift a source-free error into any `Error<E>`.
+    ///
+    /// Used where crate-internal code (which never produces a [`Error::User`])
+    /// feeds a [`Reader`](crate::Reader) that carries a caller error type.
+    #[must_use]
+    pub fn widen<E>(self) -> Error<E> {
+        match self {
+            Error::Arrow(err) => Error::Arrow(err),
+            Error::ArrowAvro(err) => Error::ArrowAvro(err),
+            Error::Avro(err) => Error::Avro(err),
+            Error::Json(err) => Error::Json(err),
+            Error::EmptySources => Error::EmptySources,
+            Error::NonRecordSchema => Error::NonRecordSchema,
+            Error::LargeHeader => Error::LargeHeader,
+            Error::NonMatchingSchemas { expected, actual } => {
+                Error::NonMatchingSchemas { expected, actual }
+            }
+            Error::ColumnNotFound(col) => Error::ColumnNotFound(col),
+            Error::ColumnIndexOutOfBounds(ind) => Error::ColumnIndexOutOfBounds(ind),
+            Error::IO(err, path) => Error::IO(err, path),
+            Error::User(never) => match never {},
+        }
+    }
+}
+
+impl<E: Display> Display for Error<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Error::Arrow(e) => write!(f, "Error from arrow: {e}"),
@@ -89,43 +121,44 @@ impl Display for Error {
                 write!(f, "Column index {ind} is out of bounds")
             }
             Error::IO(err, path) => write!(f, "Problem with {path}: {err}"),
+            Error::User(err) => write!(f, "{err}"),
         }
     }
 }
 
-impl StdError for Error {}
+impl<E: StdError> StdError for Error<E> {}
 
-impl From<ArrowError> for Error {
+impl<E> From<ArrowError> for Error<E> {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value)
     }
 }
 
-impl From<ArrowAvroError> for Error {
+impl<E> From<ArrowAvroError> for Error<E> {
     fn from(value: ArrowAvroError) -> Self {
         Self::ArrowAvro(value)
     }
 }
 
-impl From<AvroError> for Error {
+impl<E> From<AvroError> for Error<E> {
     fn from(value: AvroError) -> Self {
         Self::Avro(value)
     }
 }
 
-impl From<serde_json::Error> for Error {
+impl<E> From<serde_json::Error> for Error<E> {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
     }
 }
 
-impl From<io::Error> for Error {
+impl<E> From<io::Error> for Error<E> {
     fn from(value: io::Error) -> Self {
         Self::IO(value, "io".into())
     }
 }
 
-impl From<Infallible> for Error {
+impl<E> From<Infallible> for Error<E> {
     fn from(value: Infallible) -> Self {
         match value {}
     }
@@ -133,12 +166,15 @@ impl From<Infallible> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::Error as FullError;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::error::ArrowError;
     use arrow_avro::errors::AvroError as ArrowAvroError;
+    use std::convert::Infallible;
     use std::io;
     use std::sync::Arc;
+
+    type Error = FullError<Infallible>;
 
     #[test]
     fn test_display() {
