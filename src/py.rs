@@ -10,6 +10,8 @@ use pyo3::{
     pymodule,
 };
 use pyo3_arrow::{PyRecordBatch, PySchema};
+use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::iter::{Chain, Fuse};
@@ -19,6 +21,18 @@ use std::sync::Arc;
 /// per-read python callbacks (and cloud round-trips) into large chunks. Local
 /// files don't need this — the OS already buffers them natively.
 const PY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// Recover a [`PyErr`] smuggled across the `std::io` boundary.
+///
+/// A read/seek/write raises the exception (e.g. a `KeyboardInterrupt` mid-read)
+/// and it rides as an [`io::Error`] payload; arrow wraps that error exactly once
+/// (as `ArrowError::ExternalError`), so the arrow error's direct source is the
+/// [`io::Error`]. `None` if this isn't a wrapped python exception.
+fn recover_py_err(err: &(dyn StdError + 'static)) -> Option<PyErr> {
+    let io_err = err.source()?.downcast_ref::<io::Error>()?;
+    let py_err = io_err.get_ref()?.downcast_ref::<PyErr>()?;
+    Some(Python::attach(|py| py_err.clone_ref(py)))
+}
 
 /// A python file obtained by entering the context manager from a source
 /// factory. The manager's `__exit__` is called when this is dropped, so cloud
@@ -92,7 +106,7 @@ impl CtxIter {
 }
 
 impl Iterator for CtxIter {
-    type Item = Result<ScanSource, Error>;
+    type Item = Result<ScanSource, PyErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.factories.get(self.idx).map(|factory| {
@@ -109,7 +123,6 @@ impl Iterator for CtxIter {
                     entered,
                 )))
             })
-            .map_err(|err: PyErr| Error::IO(io::Error::other(err.to_string()), "source".into()))
         })
     }
 }
@@ -127,14 +140,14 @@ impl PathIter {
 }
 
 impl Iterator for PathIter {
-    type Item = Result<ScanSource, Error>;
+    type Item = Result<ScanSource, PyErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.paths.get(self.idx).map(|path| {
             self.idx += 1;
             match File::open(path) {
                 Ok(file) => Ok(ScanSource::File(file)),
-                Err(err) => Err(Error::IO(err, path.clone())),
+                Err(err) => Err(PyIOError::new_err(format!("I/O error: {path}: {err}"))),
             }
         })
     }
@@ -173,7 +186,7 @@ impl PyIO {
                 let res = writer.call_method1("seek", (pos,))?;
                 res.extract()
             })
-            .map_err(|err: PyErr| io::Error::other(err.to_string())),
+            .map_err(io::Error::other::<PyErr>),
             SeekFrom::Current(offset) => Python::attach(|py| {
                 let writer = self.0.bind(py);
                 let res = writer.call_method0("tell")?;
@@ -186,7 +199,7 @@ impl PyIO {
                 let res = writer.call_method1("seek", (pos,))?;
                 res.extract()
             })
-            .map_err(|err: PyErr| io::Error::other(err.to_string())),
+            .map_err(io::Error::other::<PyErr>),
             SeekFrom::End(_) => Err(io::Error::new(
                 ErrorKind::Unsupported,
                 "seeking from end is not supported",
@@ -204,7 +217,7 @@ impl Read for PyIO {
             buf.write_all(raw)?;
             Ok(raw.len())
         })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+        .map_err(io::Error::other::<PyErr>)
     }
 }
 
@@ -214,7 +227,7 @@ impl Write for PyIO {
             let res = self.0.bind(py).call_method1("write", (buf,))?;
             res.extract()
         })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+        .map_err(io::Error::other::<PyErr>)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -222,7 +235,7 @@ impl Write for PyIO {
             self.0.bind(py).call_method0("flush")?;
             Ok(())
         })
-        .map_err(|err: PyErr| io::Error::other(err.to_string()))
+        .map_err(io::Error::other::<PyErr>)
     }
 }
 
@@ -245,12 +258,16 @@ impl AvroSource {
         PathIter::new(self.paths.clone()).chain(CtxIter::new(self.sources.clone()))
     }
 
-    fn get_schema(&mut self) -> Result<SchemaRef, Error> {
+    fn get_schema(&mut self) -> Result<SchemaRef, Error<PyErr>> {
         if let Some(schema) = &self.schema {
             Ok(schema.clone())
         } else {
-            let first = self.get_sources().next().ok_or(Error::EmptySources)??;
-            let schema = get_schema(BufReader::new(first))?;
+            let first = self
+                .get_sources()
+                .next()
+                .ok_or(Error::EmptySources)?
+                .map_err(Error::User)?;
+            let schema = get_schema(BufReader::new(first)).map_err(Error::widen)?;
             self.schema = Some(schema.clone());
             Ok(schema)
         }
@@ -377,11 +394,20 @@ impl AvroBuffSink {
     }
 }
 
-impl From<Error> for PyErr {
-    fn from(value: Error) -> Self {
+impl From<Error<PyErr>> for PyErr {
+    fn from(value: Error<PyErr>) -> Self {
         match value {
-            Error::Arrow(err) => AvroError::new_err(err.to_string()),
-            Error::ArrowAvro(err) => AvroError::new_err(err.to_string()),
+            Error::User(err) => err,
+            Error::Arrow(err) => {
+                recover_py_err(&err).unwrap_or_else(|| AvroError::new_err(err.to_string()))
+            }
+            Error::ArrowAvro(err) => {
+                recover_py_err(&err).unwrap_or_else(|| AvroError::new_err(err.to_string()))
+            }
+            Error::IO(err, path) => match err.downcast::<PyErr>() {
+                Ok(py_err) => py_err,
+                Err(err) => PyIOError::new_err(format!("I/O error: {path}: {err}")),
+            },
             Error::Avro(err) => AvroError::new_err(err.to_string()),
             Error::Json(err) => AvroError::new_err(err.to_string()),
             Error::EmptySources => EmptySources::new_err("must scan at least one source"),
@@ -391,15 +417,20 @@ impl From<Error> for PyErr {
             Error::LargeHeader => {
                 AvroSpecError::new_err("header was too large to effectively parse")
             }
-            e @ Error::NonMatchingSchemas { .. } => AvroSpecError::new_err(format!("{e}")),
+            err @ Error::NonMatchingSchemas { .. } => AvroSpecError::new_err(format!("{err}")),
             Error::ColumnNotFound(col) => {
                 PyKeyError::new_err(format!("Column \"{col}\" not found in schema"))
             }
             Error::ColumnIndexOutOfBounds(ind) => {
                 PyIndexError::new_err(format!("Column index {ind} is out of bounds"))
             }
-            Error::IO(err, path) => PyIOError::new_err(format!("I/O error: {path}: {err}")),
         }
+    }
+}
+
+impl From<Error<Infallible>> for PyErr {
+    fn from(value: Error<Infallible>) -> Self {
+        value.widen::<PyErr>().into()
     }
 }
 

@@ -92,7 +92,6 @@ pub struct Reader<R: Read, I, C> {
 impl<R, E, I, P> Reader<R, I, P>
 where
     R: Read + Seek,
-    Error: From<E>,
     I: Iterator<Item = Result<R, E>>,
     P: Projection,
 {
@@ -104,10 +103,13 @@ where
     pub fn try_new(
         sources: impl IntoIterator<IntoIter = I>,
         config: ReadOptions<P>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<E>> {
         let mut sources = sources.into_iter();
-        let first = sources.next().ok_or(Error::EmptySources)??;
-        let source = config.create_reader(first)?;
+        let first = sources
+            .next()
+            .ok_or(Error::EmptySources)?
+            .map_err(Error::User)?;
+        let source = config.create_reader(first).map_err(Error::widen)?;
         let schema = source.schema();
         Ok(Self {
             sources,
@@ -125,11 +127,10 @@ where
 impl<R, E, I, P> Iterator for Reader<R, I, P>
 where
     R: Read + Seek,
-    Error: From<E>,
     I: Iterator<Item = Result<R, E>>,
     P: Projection,
 {
-    type Item = Result<RecordBatch, Error>;
+    type Item = Result<RecordBatch, Error<E>>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -149,10 +150,10 @@ where
                     Some(Ok(source)) => {
                         self.source = match self.options.create_reader(source) {
                             Ok(reader) => reader,
-                            Err(e) => return Some(Err(e)),
+                            Err(e) => return Some(Err(e.widen())),
                         };
                     }
-                    Some(Err(e)) => return Some(Err(e.into())),
+                    Some(Err(e)) => return Some(Err(Error::User(e))),
                     None => return None,
                 },
             }
@@ -163,7 +164,6 @@ where
 impl<R, E, I, P> FusedIterator for Reader<R, I, P>
 where
     R: Read + Seek,
-    Error: From<E>,
     I: Iterator<Item = Result<R, E>> + FusedIterator,
     P: Projection,
 {
@@ -181,6 +181,7 @@ mod tests {
     use arrow::compute::concat_batches;
     use arrow::datatypes::DataType;
     use std::convert::Infallible;
+    use std::error::Error as StdError;
     use std::fs::File;
     use std::io::{Cursor, Read, Seek};
     use std::mem;
@@ -195,7 +196,7 @@ mod tests {
     fn collect_one<R, E, I, P>(reader: Reader<R, I, P>) -> RecordBatch
     where
         R: Read + Seek,
-        Error: From<E>,
+        E: StdError,
         I: Iterator<Item = Result<R, E>>,
         P: Projection,
     {
@@ -437,7 +438,7 @@ mod tests {
             vec![Ok(valid), Err(std::io::Error::other("boom"))];
         let mut reader = Reader::try_new(sources, FullReadOptions::default()).unwrap();
         let last = reader.by_ref().last().unwrap();
-        assert!(matches!(last, Err(Error::IO(_, _))));
+        assert!(matches!(last, Err(Error::User(_))));
     }
 
     /// Serves a valid avro stream until `fail_at`, then returns a single I/O
@@ -513,7 +514,7 @@ mod tests {
         let sources: Vec<Result<Cursor<Vec<u8>>, std::io::Error>> =
             vec![Err(std::io::Error::other("boom"))];
         let err = Reader::try_new(sources, FullReadOptions::default()).unwrap_err();
-        assert!(matches!(err, Error::IO(_, _)));
+        assert!(matches!(err, Error::User(_)));
     }
 
     #[test]
