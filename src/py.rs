@@ -17,9 +17,10 @@ use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write
 use std::iter::Fuse;
 use std::sync::Arc;
 
-/// Hardcoded read buffer for python-backed (`PyIO`) sources, so we batch the
-/// per-read python callbacks (and cloud round-trips) into large chunks. Local
-/// files don't need this — the OS already buffers them natively.
+/// Hardcoded read buffer for python-backed (`PyIO`) sources.
+///
+/// Batches the per-read python callbacks (and cloud round-trips) into large
+/// chunks. Local files don't need this — the OS already buffers them natively.
 const PY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Recover a [`PyErr`] smuggled across the `std::io` boundary.
@@ -33,9 +34,10 @@ fn recover_py_err(err: &(dyn StdError + 'static)) -> Option<PyErr> {
     Some(Python::attach(|py| py_err.clone_ref(py)))
 }
 
-/// A python file obtained by entering the context manager from a source
-/// factory. The manager's `__exit__` is called when this is dropped, so cloud
-/// connections are released promptly after each scan.
+/// A python file obtained by entering the context manager from a source factory.
+///
+/// The manager's `__exit__` is called when this is dropped, so cloud connections
+/// are released promptly after each scan.
 #[derive(Debug)]
 struct EnteredSource {
     file: PyIO,
