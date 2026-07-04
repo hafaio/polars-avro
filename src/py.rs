@@ -6,15 +6,15 @@ use arrow_avro::compression::CompressionCodec;
 use pyo3::exceptions::{PyException, PyIOError, PyIndexError, PyKeyError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyModule, PyModuleMethods};
 use pyo3::{
-    Bound, Py, PyAny, PyErr, PyRef, PyResult, Python, create_exception, pyclass, pymethods,
-    pymodule,
+    Bound, FromPyObject, Py, PyAny, PyErr, PyRef, PyResult, Python, create_exception, pyclass,
+    pymethods, pymodule,
 };
 use pyo3_arrow::{PyRecordBatch, PySchema};
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::iter::{Chain, Fuse};
+use std::iter::Fuse;
 use std::sync::Arc;
 
 /// Hardcoded read buffer for python-backed (`PyIO`) sources, so we batch the
@@ -24,10 +24,9 @@ const PY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Recover a [`PyErr`] smuggled across the `std::io` boundary.
 ///
-/// A read/seek/write raises the exception (e.g. a `KeyboardInterrupt` mid-read)
-/// and it rides as an [`io::Error`] payload; arrow wraps that error exactly once
-/// (as `ArrowError::ExternalError`), so the arrow error's direct source is the
-/// [`io::Error`]. `None` if this isn't a wrapped python exception.
+/// The exception rides as an [`io::Error`] payload, which arrow wraps exactly
+/// once — so the arrow error's direct source is that [`io::Error`]. `None` if
+/// there's no wrapped exception.
 fn recover_py_err(err: &(dyn StdError + 'static)) -> Option<PyErr> {
     let io_err = err.source()?.downcast_ref::<io::Error>()?;
     let py_err = io_err.get_ref()?.downcast_ref::<PyErr>()?;
@@ -91,27 +90,41 @@ impl Seek for ScanSource {
     }
 }
 
-/// Iterates source factories, calling each to get a fresh context manager and
-/// entering it (`__enter__`) on demand.
+/// A single scan source, extracted from python in caller order.
+///
+/// `Path` is tried first, so a python `str` is read as a local file (natively,
+/// no GIL) and any other object is treated as a context-manager factory. Keeping
+/// both kinds in one ordered list preserves the caller's source order, matching
+/// polars.
+#[derive(FromPyObject, Debug)]
+enum Source {
+    Path(String),
+    Factory(Py<PyAny>),
+}
+
+/// Opens each [`Source`] into a [`ScanSource`] on demand, in order.
+///
+/// Local paths open natively; factories are called to get a fresh context
+/// manager which is entered (`__enter__`) here and exited when the resulting
+/// source is dropped.
 #[derive(Debug)]
-struct CtxIter {
-    factories: Arc<[Py<PyAny>]>,
+struct SourceIter {
+    sources: Arc<[Source]>,
     idx: usize,
 }
 
-impl CtxIter {
-    fn new(factories: Arc<[Py<PyAny>]>) -> Self {
-        Self { factories, idx: 0 }
-    }
-}
-
-impl Iterator for CtxIter {
+impl Iterator for SourceIter {
     type Item = Result<ScanSource, PyErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.factories.get(self.idx).map(|factory| {
-            self.idx += 1;
-            Python::attach(|py| {
+        let source = self.sources.get(self.idx)?;
+        self.idx += 1;
+        Some(match source {
+            Source::Path(path) => match File::open(path) {
+                Ok(file) => Ok(ScanSource::File(file)),
+                Err(err) => Err(PyIOError::new_err(format!("I/O error: {path}: {err}"))),
+            },
+            Source::Factory(factory) => Python::attach(|py| {
                 let ctx = factory.bind(py).call0()?;
                 let file = ctx.call_method0("__enter__")?.unbind();
                 let entered = EnteredSource {
@@ -122,38 +135,10 @@ impl Iterator for CtxIter {
                     PY_BUFFER_CAPACITY,
                     entered,
                 )))
-            })
+            }),
         })
     }
 }
-
-#[derive(Debug)]
-struct PathIter {
-    paths: Arc<[String]>,
-    idx: usize,
-}
-
-impl PathIter {
-    fn new(paths: Arc<[String]>) -> Self {
-        Self { paths, idx: 0 }
-    }
-}
-
-impl Iterator for PathIter {
-    type Item = Result<ScanSource, PyErr>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.paths.get(self.idx).map(|path| {
-            self.idx += 1;
-            match File::open(path) {
-                Ok(file) => Ok(ScanSource::File(file)),
-                Err(err) => Err(PyIOError::new_err(format!("I/O error: {path}: {err}"))),
-            }
-        })
-    }
-}
-
-type SourceIter = Chain<PathIter, CtxIter>;
 
 #[pyclass]
 #[derive(Debug)]
@@ -248,14 +233,16 @@ impl Seek for PyIO {
 #[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct AvroSource {
-    paths: Arc<[String]>,
-    sources: Arc<[Py<PyAny>]>,
+    sources: Arc<[Source]>,
     schema: Option<SchemaRef>,
 }
 
 impl AvroSource {
     fn get_sources(&self) -> SourceIter {
-        PathIter::new(self.paths.clone()).chain(CtxIter::new(self.sources.clone()))
+        SourceIter {
+            sources: self.sources.clone(),
+            idx: 0,
+        }
     }
 
     fn get_schema(&mut self) -> Result<SchemaRef, Error<PyErr>> {
@@ -277,10 +264,9 @@ impl AvroSource {
 #[pymethods]
 impl AvroSource {
     #[new]
-    #[pyo3(signature = (paths, sources))]
-    fn new(paths: Vec<String>, sources: Vec<Py<PyAny>>) -> Self {
+    #[pyo3(signature = (sources))]
+    fn new(sources: Vec<Source>) -> Self {
         Self {
-            paths: paths.into(),
             sources: sources.into(),
             schema: None,
         }

@@ -13,9 +13,8 @@ use std::sync::Arc;
 
 /// Any error raised by this crate.
 ///
-/// `E` is the error type of the caller-supplied source iterator, forwarded
-/// unchanged through [`Error::User`]. It defaults to [`Infallible`] for sources
-/// that can't fail to open (and for everything that never touches a source).
+/// `E` is the caller-supplied source iterator's error, forwarded unchanged
+/// through [`Error::User`]; it defaults to [`Infallible`].
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error<E = Infallible> {

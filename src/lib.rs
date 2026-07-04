@@ -7,6 +7,7 @@
 //! details on `utf8_view` and type mapping behavior.
 
 #![warn(clippy::pedantic)]
+#![warn(clippy::too_long_first_doc_paragraph)]
 #![warn(missing_docs)]
 
 mod error;
