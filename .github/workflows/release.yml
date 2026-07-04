@@ -129,21 +129,8 @@ jobs:
           name: sdist
           path: dist/
 
-  publish:
-    needs: [build, sdist]
-    runs-on: ubuntu-latest
-    environment: pypi
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist/
-          merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/
-
   release:
-    needs: [prepare, publish]
+    needs: [prepare, build, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -169,8 +156,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "v${{ needs.prepare.outputs.version }}" --generate-notes
 
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
   docs:
-    needs: [release, prepare]
+    needs: [publish, prepare]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
