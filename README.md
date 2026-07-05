@@ -155,7 +155,8 @@ Standard `cargo` commands will build and test the rust library.
 
 ### Python
 
-The python library is built with uv and maturin. The rust components should build once, ance otherwise allow usage and testing.
+The python library is built with uv and maturin. `uv sync` compiles the rust
+extension once, after which you can use and test the library from python.
 
 You may need to recompile the python bindings with `uv run maturin develop`.
 
@@ -185,15 +186,8 @@ uv run pytest --benchmark-only
 
 ### Releasing
 
-```sh
-rm -rf dist
-uv build --sdist
-uv run maturin build -r -o dist --target aarch64-apple-darwin
-uv run maturin build -r -o dist --target aarch64-unknown-linux-gnu --zig
-uv publish --username __token__
-```
-
-### To Do
-
-- [ ] reimplement single column reader?
-- [ ] reimplement better workarounds for types that don't exist, e.g. serialize polars cat/enum to arrow enum and vice versa
+Releases are automated. Trigger the
+[`release`](.github/workflows/release.yml) workflow from the Actions tab (or
+`gh workflow run release.yml`), choosing the version bump (`patch`, `minor`, or
+`major`). It gates on the full test suite, builds wheels and an sdist, commits
+and tags the version bump, and publishes to PyPI via OIDC trusted publishing.
