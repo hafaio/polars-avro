@@ -163,7 +163,7 @@ You may need to recompile the python bindings with `uv run maturin develop`.
 
 ```sh
 cargo fmt --check
-cargo clippy --all-features --tests
+cargo clippy --all-features --tests -- -D warnings
 cargo test
 uv run ruff format --check
 uv run ruff check

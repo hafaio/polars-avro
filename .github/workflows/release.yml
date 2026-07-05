@@ -22,32 +22,7 @@ env:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install uv
-          rustup component add --toolchain nightly clippy
-      - name: Check rust format
-        run: cargo fmt --check
-      - name: Check rust style
-        run: cargo clippy --all-features --tests
-      - name: Run rust tests
-        run: cargo test
-      - name: Check ruff format
-        run: uv run ruff format --check
-      - name: Check with ruff
-        run: uv run ruff check
-      - name: Run pyright
-        run: uv run pyright
-      - name: Test with pytest
-        run: uv run pytest
+    uses: ./.github/workflows/build.yml
 
   prepare:
     runs-on: ubuntu-latest
@@ -55,7 +30,7 @@ jobs:
     outputs:
       version: ${{ steps.bump.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -88,7 +63,7 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -111,7 +86,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -133,7 +108,7 @@ jobs:
     needs: [prepare, build, sdist]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -169,20 +144,14 @@ jobs:
         with:
           packages-dir: dist/
 
-  docs:
+  docs-build:
     needs: [publish, prepare]
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: "pages"
-      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: v${{ needs.prepare.outputs.version }}
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -193,9 +162,20 @@ jobs:
           uv sync
       - name: Build site
         run: uv run sphinx-build -M html docs out
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: "./out/html"
+
+  docs-deploy:
+    needs: docs-build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: "pages"
+      cancel-in-progress: false
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
