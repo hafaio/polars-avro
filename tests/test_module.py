@@ -15,6 +15,10 @@ from pytest_benchmark.fixture import BenchmarkFixture
 
 import polars_avro
 
+# naive so it can feed both the tz-aware and tz-naive datetime schemas
+TIMESTAMP = datetime(2026, 1, 2, 3, 4, 5, 678000)  # noqa: DTZ001
+DATE = TIMESTAMP.date()
+
 # ------------------------- #
 # Data generation functions #
 # ------------------------- #
@@ -167,33 +171,33 @@ def create_complex_frame(n: int) -> DataFrame:
             id="longs",
         ),
         pytest.param(
-            pl.from_dict({"col": [date.today(), None]}, schema={"col": pl.Date}),
+            pl.from_dict({"col": [DATE, None]}, schema={"col": pl.Date}),
             id="dates",
         ),
         pytest.param(
             pl.from_dict(
-                {"col": [datetime.now(), None]},
+                {"col": [TIMESTAMP, None]},
                 schema={"col": pl.Datetime("ms", "UTC")},
             ),
             id="datetime-ms",
         ),
         pytest.param(
             pl.from_dict(
-                {"col": [datetime.now(), None]},
+                {"col": [TIMESTAMP, None]},
                 schema={"col": pl.Datetime("us", "UTC")},
             ),
             id="datetime-us",
         ),
         pytest.param(
             pl.from_dict(
-                {"col": [datetime.now(), None]},
+                {"col": [TIMESTAMP, None]},
                 schema={"col": pl.Datetime("ms")},
             ),
             id="datetime-ms-local",
         ),
         pytest.param(
             pl.from_dict(
-                {"col": [datetime.now(), None]},
+                {"col": [TIMESTAMP, None]},
                 schema={"col": pl.Datetime("us")},
             ),
             id="datetime-us-local",

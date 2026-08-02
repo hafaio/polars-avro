@@ -61,7 +61,12 @@ def test_predicate_pushdown_avro() -> None:
     explain = lazy.explain()
 
     assert "FILTER" not in explain
-    assert """SELECTION: [(col("calories")) > (80)]""" in explain
+    # polars renders the expression itself differently between versions
+    (selection,) = [
+        line for line in explain.splitlines() if line.strip().startswith("SELECTION:")
+    ]
+    assert "calories" in selection
+    assert str(thresh) in selection
 
     normal = lazy.collect()
     unoptimized = lazy.collect(optimizations=pl.QueryOptFlags.none())
@@ -308,7 +313,7 @@ def test_projection_different_types_errors() -> None:
     write_avro(pl.DataFrame({"x": ["a"]}), two)
     one.seek(0)
     two.seek(0)
-    with pytest.raises(Exception):  # noqa: B017, PT011
+    with pytest.raises(Exception):  # noqa: B017
         scan_avro([one, two]).select("x").collect()  # type: ignore
 
 
@@ -352,5 +357,3 @@ def test_cloud_scan() -> None:
 
 class SentinelError(AssertionError):
     """A sentinel error for raising."""
-
-    pass
