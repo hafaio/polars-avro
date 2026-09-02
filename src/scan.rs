@@ -172,14 +172,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Error, FullReadOptions, Projection, ReadOptions, Reader};
-    use apache_avro::schema::{FixedSchema, RecordField, RecordSchema, Schema, UnionSchema};
+    use apache_avro::schema::{
+        DecimalSchema, FixedSchema, InnerDecimalSchema, Name, RecordField, Schema, UnionSchema,
+        UuidSchema,
+    };
     use apache_avro::types::{Record, Value};
     use apache_avro::{
         AvroResult, Days, Decimal as AvroDecimal, Duration as AvroDuration, Millis, Months, Writer,
     };
     use arrow::array::{Array, RecordBatch};
     use arrow::compute::concat_batches;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, IntervalUnit};
     use std::convert::Infallible;
     use std::error::Error as StdError;
     use std::fs::File;
@@ -232,23 +235,16 @@ mod tests {
         vals: impl IntoIterator<Item = impl Into<Value>>,
     ) -> AvroResult<Cursor<Vec<u8>>> {
         let mut buff = Cursor::new(Vec::new());
-        let schema = Schema::Record(
-            RecordSchema::builder()
-                .name("base".into())
-                .fields(vec![
-                    RecordField::builder()
-                        .name(name.into())
-                        .schema(dtype)
-                        .build(),
-                ])
-                .lookup([(name.into(), 0)].into())
-                .build(),
-        );
-        let mut writer = Writer::new(&schema, &mut buff);
+        let schema = Schema::record(Name::new("base")?)
+            .fields(vec![
+                RecordField::builder().name(name).schema(dtype).build(),
+            ])
+            .build();
+        let mut writer = Writer::new(&schema, &mut buff)?;
         for val in vals {
             let mut first = Record::new(&schema).unwrap();
             first.put(name, val);
-            writer.append(first)?;
+            writer.append_value(first)?;
         }
         writer.flush()?;
         mem::drop(writer);
@@ -305,7 +301,7 @@ mod tests {
     fn test_fixed() {
         let buff = write_avro(
             "fixed",
-            Schema::Fixed(FixedSchema::builder().name("fixed".into()).size(4).build()),
+            Schema::fixed(Name::new("fixed").unwrap(), 4).build(),
             [
                 Value::Fixed(4, vec![1, 2, 3, 4]),
                 Value::Fixed(4, vec![5, 6, 7, 8]),
@@ -321,10 +317,10 @@ mod tests {
     fn test_decimal() {
         let buff = write_avro(
             "decimal",
-            Schema::Decimal(apache_avro::schema::DecimalSchema {
+            Schema::Decimal(DecimalSchema {
                 precision: 10,
                 scale: 2,
-                inner: Box::new(Schema::Bytes),
+                inner: InnerDecimalSchema::Bytes,
             }),
             [
                 Value::Decimal(AvroDecimal::from(vec![0x64u8])),
@@ -341,7 +337,7 @@ mod tests {
     fn test_uuid_binary() {
         let buff = write_avro(
             "uuid",
-            Schema::Uuid,
+            Schema::Uuid(UuidSchema::String),
             [Value::Uuid(
                 Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap(),
             )],
@@ -365,7 +361,7 @@ mod tests {
     fn test_uuid_view() {
         let buff = write_avro(
             "uuid",
-            Schema::Uuid,
+            Schema::Uuid(UuidSchema::String),
             [Value::Uuid(
                 Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8").unwrap(),
             )],
@@ -667,12 +663,17 @@ mod tests {
         assert!(matches!(err, Error::IO(_, _)), "{err:?}");
     }
 
-    /// arrow-avro will not deserialize durations
+    /// Avro duration is read as a month/day/nano interval
     #[test]
-    fn test_duration_error() {
+    fn test_duration() {
         let buff = write_avro(
             "duration",
-            Schema::Duration,
+            Schema::Duration(
+                FixedSchema::builder()
+                    .name(Name::new("duration").unwrap())
+                    .size(12)
+                    .build(),
+            ),
             [Value::Duration(AvroDuration::new(
                 Months::new(1),
                 Days::new(2),
@@ -680,17 +681,20 @@ mod tests {
             ))],
         )
         .unwrap();
-        let err = Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap_err();
-        assert!(matches!(err, Error::Arrow(_)));
+        let frame = collect_one(Reader::try_new([ok(buff)], FullReadOptions::default()).unwrap());
+        assert_eq!(
+            frame.column(0).data_type(),
+            &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
     }
 
     /// Root Avro schema must be a Record
     #[test]
     fn test_single_column_error() {
         let mut buff = Cursor::new(Vec::new());
-        let mut writer = Writer::new(&Schema::Int, &mut buff);
-        writer.append(1).unwrap();
-        writer.append(2).unwrap();
+        let mut writer = Writer::new(&Schema::Int, &mut buff).unwrap();
+        writer.append_value(1).unwrap();
+        writer.append_value(2).unwrap();
         writer.flush().unwrap();
         mem::drop(writer);
         buff.set_position(0);

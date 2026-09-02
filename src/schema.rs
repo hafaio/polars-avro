@@ -137,7 +137,7 @@ impl<A: Deref<Target = [usize]>> Projection for IndProj<A> {
 mod tests {
     use super::super::Error;
     use super::{IndProj, NameProj, Projection, get_schema};
-    use apache_avro::schema::{RecordField, RecordSchema, Schema as ApacheSchema};
+    use apache_avro::schema::{Name, RecordField, Schema as ApacheSchema};
     use std::sync::Arc;
 
     #[test]
@@ -151,26 +151,22 @@ mod tests {
 
     /// A three field record (`a: int`, `b: string`, `c: boolean`) to project against.
     fn record_schema() -> ApacheSchema {
-        ApacheSchema::Record(
-            RecordSchema::builder()
-                .name("base".into())
-                .fields(vec![
-                    RecordField::builder()
-                        .name("a".into())
-                        .schema(ApacheSchema::Int)
-                        .build(),
-                    RecordField::builder()
-                        .name("b".into())
-                        .schema(ApacheSchema::String)
-                        .build(),
-                    RecordField::builder()
-                        .name("c".into())
-                        .schema(ApacheSchema::Boolean)
-                        .build(),
-                ])
-                .lookup([("a".into(), 0), ("b".into(), 1), ("c".into(), 2)].into())
-                .build(),
-        )
+        ApacheSchema::record(Name::new("base").unwrap())
+            .fields(vec![
+                RecordField::builder()
+                    .name("a")
+                    .schema(ApacheSchema::Int)
+                    .build(),
+                RecordField::builder()
+                    .name("b")
+                    .schema(ApacheSchema::String)
+                    .build(),
+                RecordField::builder()
+                    .name("c")
+                    .schema(ApacheSchema::Boolean)
+                    .build(),
+            ])
+            .build()
     }
 
     /// Pull the ordered field names out of a projected record schema.

@@ -245,11 +245,7 @@ def test_scan_in_memory() -> None:
 
 
 def test_read_map_type() -> None:
-    """Test that we can read a map type.
-
-    Note: arrow-avro reads null map values as empty lists instead of null.
-    This test asserts the actual (imperfect) behavior.
-    """
+    """Test that we can read a map type."""
     buff = BytesIO()
     values = [{"map": {"a": 5}}, {"map": None}, {"map": {"c": 8, "f": -10}}]
     fastavro.writer(  # type: ignore
@@ -266,9 +262,8 @@ def test_read_map_type() -> None:
     buff.seek(0)
     # we need to sort the list to guarantee order for comparison
     res = scan_avro(buff).select(pl.col("map").list.sort()).collect()  # type: ignore
-    # arrow-avro limitation: null map values are read as empty lists
     expected = pl.from_dict(
-        {"map": [[["a", 5]], [], [["c", 8], ["f", -10]]]},
+        {"map": [[["a", 5]], None, [["c", 8], ["f", -10]]]},
         schema={"map": pl.List(pl.Struct({"key": pl.String, "value": pl.Int32}))},
     )
     assert res.equals(expected)
